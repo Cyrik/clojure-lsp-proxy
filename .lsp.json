@@ -1,0 +1,16 @@
+{
+  "clojure-lsp-proxy": {
+    "command": "${CLAUDE_PLUGIN_ROOT}/bin/clojure-lsp-proxy-server",
+    "args": [],
+    "extensionToLanguage": {
+      ".clj": "clojure",
+      ".cljs": "clojure",
+      ".cljc": "clojure",
+      ".edn": "clojure"
+    },
+    "startupTimeout": 300000,
+    "env": {
+      "CLOJURE_LSP_PROXY_SERVER": "/Users/lukas/Workspace/clojure/clojure-lsp/clojure-lsp"
+    }
+  }
+}

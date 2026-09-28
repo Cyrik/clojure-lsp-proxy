@@ -1,0 +1,10 @@
+#!/bin/sh
+# Claude Code hook: tells every proxy of the project that a Bash command
+# starts; see src/clojure_lsp_proxy/hooks.clj. Never fails the tool call.
+root="$(cd "$(dirname "$0")/.." && pwd)"
+if ! command -v bb >/dev/null 2>&1; then
+  PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
+  export PATH
+fi
+command -v bb >/dev/null 2>&1 || exit 0
+exec bb --config "$root/bb.edn" -m clojure-lsp-proxy.hooks start

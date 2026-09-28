@@ -1,0 +1,10 @@
+#!/bin/sh
+# Command line over a running proxy's control socket; see
+# src/clojure_lsp_proxy/cli.clj for the commands.
+set -eu
+root="$(cd "$(dirname "$0")/.." && pwd)"
+if ! command -v bb >/dev/null 2>&1; then
+  PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
+  export PATH
+fi
+exec bb --config "$root/bb.edn" -m clojure-lsp-proxy.cli "$@"

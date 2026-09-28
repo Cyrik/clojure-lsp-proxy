@@ -1,0 +1,19 @@
+{:paths ["src"]
+ :tasks
+ {:requires ([babashka.process :as p])
+  test {:doc "Run every suite: framing, change reports, detection, proxy, gate and rename end to end."
+        :task (let [suites ["test/framing_test.bb"
+                            "test/changes_test.bb"
+                            "test/detect_test.bb"
+                            "test/proxy_test.bb"
+                            "test/gate_test.bb"
+                            "test/rename_test.bb"]
+                    failed (vec (filter (fn [suite]
+                                          (pos? (:exit (p/shell {:continue true} "bb" suite))))
+                                        suites))]
+                (when (seq failed)
+                  (println "Failed suites:" (pr-str failed))
+                  (System/exit (count failed))))}
+  serve {:doc "Start the proxy on stdio. CLOJURE_LSP_PROXY_SERVER selects the server binary."
+       :requires ([clojure-lsp-proxy.main :as main])
+       :task (apply main/-main *command-line-args*)}}}

@@ -1,0 +1,14 @@
+#!/bin/sh
+# Starts the proxy with the plugin's own Babashka configuration. Claude Code
+# runs this in place of clojure-lsp; arguments go to the server unchanged.
+#
+# Passing the plugin's bb.edn with --config keeps the project's own bb.edn
+# out of the proxy's classpath. Agents launched from an editor or app can
+# inherit a PATH without bb; the usual install locations are added then.
+set -eu
+root="$(cd "$(dirname "$0")/.." && pwd)"
+if ! command -v bb >/dev/null 2>&1; then
+  PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
+  export PATH
+fi
+exec bb --config "$root/bb.edn" -m clojure-lsp-proxy.main "$@"

@@ -1,0 +1,9 @@
+{
+  "name": "clojure-lsp-proxy",
+  "version": "0.1.0",
+  "description": "Runs clojure-lsp behind a Babashka proxy that keeps Claude Code's LSP navigation correct after shell-side file changes and adds a rename command.",
+  "author": {
+    "name": "Lukas Domagala"
+  },
+  "keywords": ["clojure", "clojure-lsp", "lsp", "claude-code"]
+}
