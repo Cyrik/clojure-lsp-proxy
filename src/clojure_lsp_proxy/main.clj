@@ -22,6 +22,7 @@
   (:require [babashka.fs :as fs]
             [babashka.process :as p]
             [clojure.java.io :as io]
+            [clojure.string :as str]
             [clojure-lsp-proxy.control :as control]
             [clojure-lsp-proxy.detect :as detect]
             [clojure-lsp-proxy.framing :as framing]
@@ -171,11 +172,24 @@
       :else (do (warn! "ignoring CLOJURE_LSP_PROXY_SEND_DEADLINE_MS" (pr-str setting) "; using" default-send-deadline-ms)
                 default-send-deadline-ms))))
 
+(defn- server-command
+  "The server to run: `CLOJURE_LSP_PROXY_SERVER` when set (a path or a
+  command on PATH), else `clojure-lsp` on PATH. A path that is not an
+  executable file is ignored in favour of the default and returned as
+  `:ignored` for the caller to log, so that a stale setting degrades to
+  the stock server instead of a missing binary."
+  []
+  (let [setting (System/getenv "CLOJURE_LSP_PROXY_SERVER")]
+    (cond
+      (str/blank? setting) {:command "clojure-lsp"}
+      (and (str/includes? setting "/") (not (fs/executable? setting))) {:command "clojure-lsp" :ignored setting}
+      :else {:command setting})))
+
 (defn -main [& server-args]
   (let [project-root (project/root)
         pid (.pid (java.lang.ProcessHandle/current))
         log (log/open (log-path project-root pid))
-        command (or (System/getenv "CLOJURE_LSP_PROXY_SERVER") "clojure-lsp")
+        {:keys [command ignored]} (server-command)
         server (p/process (into [command] server-args))
         proxy {:log log
                :pid pid
@@ -189,6 +203,7 @@
                :client-out System/out
                :client-lock (Object.)
                :gate-lock (Object.)
+               :snapshot-lock (Object.)
                :own-request-counter (atom 0)
                :send-deadline-ms (send-deadline-ms)
                :state (atom (merge {:exit-forwarded? false
@@ -211,6 +226,9 @@
                 :plugin-root (System/getenv "CLAUDE_PLUGIN_ROOT")
                 :send-deadline-ms (:send-deadline-ms proxy)
                 :log (:path log))
+    (when ignored
+      (log-event! proxy "server-fallback" :ignored ignored :command command)
+      (warn! "CLOJURE_LSP_PROXY_SERVER" ignored "is not an executable file; running" command "from PATH"))
     (let [control (control/start! proxy (control/socket-path project-root pid))]
       (.addShutdownHook (Runtime/getRuntime) (Thread. #(on-termination! proxy control) "termination"))
       (run-thread! proxy "client->server" #(client-loop proxy))

@@ -161,7 +161,7 @@
 
 ;;; sends
 
-(declare start-send!)
+(declare start-send! forward!)
 
 (defn- schedule!
   "Runs `f` under the gate lock after `delay-ms`."
@@ -181,8 +181,7 @@
         t (now)]
     (when gate-closed-ms
       (doseq [{:keys [body msg held-ms]} held]
-        (transport/log-message! proxy "c->s" msg :held-ms (- t held-ms))
-        (transport/send-to-server! proxy body))
+        (forward! proxy body msg :held-ms (- t held-ms)))
       (swap! state assoc :held [] :gate-closed-ms nil)
       (let [open? (not (closed? @state))]
         (transport/log-event! proxy "gate-open"
@@ -218,8 +217,10 @@
   analysis clears them."
   [{:keys [state] :as proxy} reason]
   (let [{:keys [in-flight]} @state]
-    (transport/log-event! proxy "send-dropped" :send (:id in-flight) :reason reason
-                          :duration-ms (- (now) (:sent-ms in-flight)))
+    (apply transport/log-event! proxy "send-dropped"
+           (cond-> [:send (:id in-flight) :reason reason :duration-ms (- (now) (:sent-ms in-flight))]
+             (= "no-analysis" reason)
+             (conj :hint "no analysis progress arrived; is the server the clojure-lsp fork that reports watched-file analysis (README, Installing)?")))
     (swap! state #(-> %
                       (assoc :in-flight nil)
                       (update :unconfirmed merge (:changes in-flight))))))
@@ -455,8 +456,15 @@
 
 ;;; client-side gating (C3)
 
-(defn- forward! [proxy body msg]
-  (transport/log-message! proxy "c->s" msg)
+(defn- forward! [{:keys [state] :as proxy} body msg & log-fields]
+  ;; These inputs can replace analysis without passing through the disk check.
+  ;; A later restoration of previously reported bytes must be reported again.
+  (when (contains? #{"textDocument/didOpen" "textDocument/didChange"
+                     "textDocument/didSave" "textDocument/didClose"
+                     "workspace/didChangeWatchedFiles"}
+                   (get msg "method"))
+    (swap! state assoc :self-reported {}))
+  (apply transport/log-message! proxy "c->s" msg log-fields)
   (transport/send-to-server! proxy body))
 
 (defn- hold! [{:keys [state] :as proxy} body msg]

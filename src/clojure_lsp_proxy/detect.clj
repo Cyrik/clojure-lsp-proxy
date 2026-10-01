@@ -28,7 +28,8 @@
             [clojure.string :as str])
   (:import [java.nio.file Files LinkOption Path]
            [java.nio.file.attribute FileTime]
-           [java.security MessageDigest]))
+           [java.security MessageDigest]
+           [java.util.concurrent TimeUnit]))
 
 (def ^:private nul-pattern (re-pattern (str (char 0))))
 
@@ -152,24 +153,36 @@
            (partition 2)
            (map second)))))
 
-(defn- content-state
-  "A fingerprint of the file's content (SHA-1, hex), or :absent."
+(defn- file-state
+  "The file's content fingerprint (SHA-1, hex) with its modification and
+  inode change times in nanoseconds, or `{:state :absent}`. The times tell
+  a write apart from the content it left behind: clojure-lsp reads a
+  reported file only after its debounce, so a file written and restored
+  in between was analyzed with the intermediate content although its
+  bytes match."
   [path]
-  (if (fs/exists? path {:nofollow-links true})
-    (let [digest (.digest (MessageDigest/getInstance "SHA-1") (Files/readAllBytes (fs/path path)))]
-      (str/join (map #(format "%02x" %) digest)))
-    :absent))
+  (let [options (into-array LinkOption [LinkOption/NOFOLLOW_LINKS])
+        file (fs/path path)]
+    (if (fs/exists? file {:nofollow-links true})
+      (let [digest (.digest (MessageDigest/getInstance "SHA-1") (Files/readAllBytes file))]
+        {:state (str/join (map #(format "%02x" %) digest))
+         :mtime (.to (Files/getLastModifiedTime file options) TimeUnit/NANOSECONDS)
+         :ctime (try
+                  (.to ^FileTime (Files/getAttribute file "unix:ctime" options) TimeUnit/NANOSECONDS)
+                  (catch Exception _ nil))})
+      {:state :absent})))
 
 (defn reported-state
-  "What to remember about a path the proxy reports itself: the time and
-  the content state of the write it reports."
+  "What to remember about a path the proxy reports itself: when, and the
+  file state (`file-state`) of the write it reports."
   [path]
-  {:at (System/currentTimeMillis) :state (content-state path)})
+  (assoc (file-state path) :at (System/currentTimeMillis)))
 
 (defn as-reported?
-  "Whether the path's content is still the one `reported-state` recorded."
-  [{:keys [state]} path]
-  (= state (content-state path)))
+  "Whether the path is still exactly as `reported-state` recorded it:
+  same content and no write since."
+  [reported path]
+  (= (select-keys reported [:state :mtime :ctime]) (file-state path)))
 
 (defn changed-paths
   "The absolute paths a command changed since the snapshot `before`, from

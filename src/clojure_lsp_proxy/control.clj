@@ -7,6 +7,8 @@
             [cheshire.core :as json]
             [clojure-lsp-proxy.changes :as changes]
             [clojure-lsp-proxy.detect :as detect]
+            [clojure-lsp-proxy.edit :as edit]
+            [clojure-lsp-proxy.format :as fmt]
             [clojure-lsp-proxy.gate :as gate]
             [clojure-lsp-proxy.project :as project]
             [clojure-lsp-proxy.rename :as rename]
@@ -27,9 +29,12 @@
 
 (defn- changed!
   "Reports `files`; with `wait`, replies once the gate has opened again."
-  [{:keys [project-root send-deadline-ms] :as proxy} {:strs [files wait]}]
+  [{:keys [project-root send-deadline-ms state gate-lock] :as proxy} {:strs [files wait]}]
   (let [report (changes/report-for-paths project-root files)
-        {:keys [reported queued]} (gate/report-changes! proxy report)]
+        {:keys [reported queued]} (locking gate-lock
+                                   (when (seq report)
+                                     (swap! state assoc :self-reported {}))
+                                   (gate/report-changes! proxy report))]
     (if wait
       (let [started (System/currentTimeMillis)
             opened? (gate/await-open proxy (* 2 send-deadline-ms))]
@@ -39,12 +44,10 @@
          :timed_out (not opened?)})
       {:ok true :reported reported :queued queued})))
 
-;;; Bash brackets (plan Decision 6): a snapshot per tool use before the
-;;; command, a check against it afterwards. Snapshots are keyed by Claude
-;;; Code's tool_use_id because parallel Bash calls interleave their hooks;
-;;; a finish whose start never arrived (hook missing or timed out) falls
-;;; back to the snapshot the previous check left, or the one taken at
-;;; startup (Decision 8).
+;;; Snapshots are keyed by tool_use_id because Bash brackets can overlap.
+;;; The shared checkpoint also covers writes between brackets. Its scan,
+;;; report and update run under snapshot-lock, before taking gate-lock;
+;;; analysis waits never hold snapshot-lock.
 
 (def max-snapshots
   "Brackets whose finish never arrives (an interrupted command) would
@@ -59,22 +62,16 @@
 (defn- bracket-key [tool-use-id]
   (or tool-use-id ::anonymous))
 
-(defn- bash-started! [{:keys [state project-root]} {:strs [tool_use_id]}]
-  (let [snapshot (detect/snapshot project-root)]
-    (swap! state update :snapshots #(prune-snapshots (assoc % (bracket-key tool_use_id) snapshot)))
-    {:ok true}))
-
 (def self-reported-retention-ms
-  "How long a path the proxy reported itself (an applied rename) stays
+  "How long a path the proxy reported itself stays
   excluded from the checks of brackets that were open at the time."
   600000)
 
 (defn- without-self-reported
   "`paths` minus those the proxy itself reported at or after `marker-ms`
-  whose content is still what it reported: an applied rename run through
-  Claude's Bash tool would otherwise be analyzed a second time by the
-  command's own bracket. A path the command changed again after the
-  rename stays in."
+  whose content is still what it reported. Overlapping checks and the
+  bracket around an applied rename must not analyze the same write again;
+  a later write to the path stays in."
   [self-reported marker-ms paths]
   (if marker-ms
     (remove (fn [path]
@@ -84,26 +81,56 @@
             paths)
     paths))
 
-(defn- bash-finished! [{:keys [state project-root] :as proxy} {:strs [tool_use_id bash_edit_diff]}]
-  (let [key (bracket-key tool_use_id)
-        own (get-in @state [:snapshots key])
-        before (or own (:last-snapshot @state))
-        diff-files (get bash_edit_diff "changedFiles")
-        {:keys [paths snapshot]} (detect/changed-paths before diff-files)
-        paths (without-self-reported (:self-reported @state) (:marker-ms before) paths)
-        result (gate/report-changes! proxy (changes/report-for-paths project-root paths))
-        fresh-enough (- (System/currentTimeMillis) self-reported-retention-ms)]
-    (swap! state #(-> %
-                      (update :snapshots dissoc key)
-                      (assoc :last-snapshot snapshot)
-                      (update :self-reported (fn [m] (into {} (filter (fn [[_ {:keys [at]}]] (> at fresh-enough)) m))))))
-    (transport/log-event! proxy "bash-check"
-                          :tool-use-id tool_use_id
-                          :fallback (nil? own)
-                          :diff-files (count diff-files)
-                          :candidates (count paths)
-                          :reported (:reported result))
-    (merge {:ok true} result)))
+(defn- check-changes!
+  "Queues changes since `before` and advances the shared checkpoint only
+  after reporting them. Caller holds snapshot-lock; a missing baseline
+  starts tracking git when it becomes available."
+  [{:keys [state project-root gate-lock] :as proxy} before reported-paths]
+  (let [{:keys [paths snapshot]} (if before
+                                 (detect/changed-paths before reported-paths)
+                                 {:paths (set reported-paths) :snapshot (detect/snapshot project-root)})]
+    ;; Native document updates invalidate remembered reports under gate-lock.
+    ;; Comparing and installing fingerprints must not straddle an invalidation.
+    (locking gate-lock
+      (let [paths (without-self-reported (:self-reported @state) (:marker-ms before) paths)
+            report (changes/report-for-paths project-root paths)
+            reported-states (into {} (map (fn [uri]
+                                            (let [path (edit/uri->path uri)]
+                                              [path (detect/reported-state path)])))
+                                  (keys report))
+            result (gate/report-changes! proxy report)
+            fresh-enough (- (System/currentTimeMillis) self-reported-retention-ms)]
+        (swap! state #(-> %
+                          (assoc :last-snapshot snapshot)
+                          (update :self-reported merge reported-states)
+                          (update :self-reported (fn [m] (into {} (filter (fn [[_ {:keys [at]}]] (> at fresh-enough)) m))))))
+        {:snapshot snapshot :candidates (count paths) :result result}))))
+
+(defn- reconcile! [{:keys [state] :as proxy} source]
+  (let [{:keys [result] :as check} (check-changes! proxy (:last-snapshot @state) [])]
+    (transport/log-event! proxy "disk-check" :source source :reported (:reported result))
+    check))
+
+(defn- bash-started! [{:keys [state snapshot-lock] :as proxy} {:strs [tool_use_id]}]
+  (locking snapshot-lock
+    (let [{:keys [snapshot]} (reconcile! proxy "bash-started")]
+      (swap! state update :snapshots #(prune-snapshots (assoc % (bracket-key tool_use_id) snapshot)))
+      {:ok true})))
+
+(defn- bash-finished! [{:keys [state snapshot-lock] :as proxy} {:strs [tool_use_id bash_edit_diff]}]
+  (locking snapshot-lock
+    (let [key (bracket-key tool_use_id)
+          own (get-in @state [:snapshots key])
+          diff-files (get bash_edit_diff "changedFiles")
+          {:keys [result candidates]} (check-changes! proxy (or own (:last-snapshot @state)) diff-files)]
+      (swap! state update :snapshots dissoc key)
+      (transport/log-event! proxy "bash-check"
+                            :tool-use-id tool_use_id
+                            :fallback (nil? own)
+                            :diff-files (count diff-files)
+                            :candidates candidates
+                            :reported (:reported result))
+      (merge {:ok true} result))))
 
 (defn handle-request [proxy {:strs [op] :as request}]
   (case op
@@ -111,7 +138,12 @@
     "changed" (changed! proxy request)
     "bash-started" (bash-started! proxy request)
     "bash-finished" (bash-finished! proxy request)
-    "rename" (rename/rename! proxy request)
+    "rename" (do (locking (:snapshot-lock proxy)
+                   (reconcile! proxy "rename"))
+                 (rename/rename! proxy request))
+    "format" (do (locking (:snapshot-lock proxy)
+                   (reconcile! proxy "format"))
+                 (fmt/format! proxy request))
     {:ok false :error (str "unknown op: " (pr-str op))}))
 
 (declare serve-request!)

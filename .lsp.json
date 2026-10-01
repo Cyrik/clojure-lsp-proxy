@@ -8,9 +8,6 @@
       ".cljc": "clojure",
       ".edn": "clojure"
     },
-    "startupTimeout": 300000,
-    "env": {
-      "CLOJURE_LSP_PROXY_SERVER": "/Users/lukas/Workspace/clojure/clojure-lsp/clojure-lsp"
-    }
+    "startupTimeout": 300000
   }
 }

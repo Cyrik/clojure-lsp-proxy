@@ -5,11 +5,12 @@
     clojure-lsp-proxy changed [--wait] <path>...
     clojure-lsp-proxy rename <file> <line> <col> <new-name> [--apply]
     clojure-lsp-proxy rename --symbol <ns/name or ns> <new-name> [--apply]
+    clojure-lsp-proxy format <file> [--apply]
 
-  `rename` prints the edits clojure-lsp proposes and changes nothing;
-  with `--apply` the proxy applies them and tells every other proxy of the
-  project about the touched files. Lines and columns are one-based, as
-  editors show them.
+  `rename` and `format` print the edits clojure-lsp proposes and change
+  nothing; with `--apply` the proxy applies them and tells every other
+  proxy of the project about the touched files. Lines and columns are
+  one-based, as editors show them.
 
   Proxies are found under `CLAUDE_PROJECT_DIR` when it is set (Claude Code
   sets it for its Bash tool); otherwise under the current directory and
@@ -50,7 +51,8 @@
     (println "usage: clojure-lsp-proxy status")
     (println "       clojure-lsp-proxy changed [--wait] <path>...")
     (println "       clojure-lsp-proxy rename <file> <line> <col> <new-name> [--apply]")
-    (println "       clojure-lsp-proxy rename --symbol <ns/name or ns> <new-name> [--apply]")))
+    (println "       clojure-lsp-proxy rename --symbol <ns/name or ns> <new-name> [--apply]")
+    (println "       clojure-lsp-proxy format <file> [--apply]")))
 
 (defn- shown-path
   "A file URI as a path relative to the current directory."
@@ -76,7 +78,11 @@
                 (get summary "renamed_files") " files renamed"
                 (when applied (str "; " (count touched) " paths reported")))))
 
-(defn- rename [roots request]
+(defn- edit-command
+  "Sends an edit-producing request (rename, format) to the first proxy
+  that answers, prints the edit and, when it was applied, tells the other
+  proxies of the project about the touched files."
+  [roots request]
   (let [sockets (mapcat client/sockets roots)]
     (if (empty? sockets)
       (do (binding [*out* *err*]
@@ -91,7 +97,7 @@
           (not (get reply "ok")) (do (binding [*out* *err*] (println "clojure-lsp-proxy:" (get reply "error"))) 1)
           :else (do (print-edit reply)
                     ;; other sessions' servers must re-read the touched files too
-                    (when (get reply "applied")
+                    (when (and (get reply "applied") (seq (get reply "touched")))
                       (doseq [socket (remove #{answering} sockets)]
                         (client/request! socket {:op "changed" :files (get reply "touched")} request-timeout-ms)))
                     0))))))
@@ -109,6 +115,12 @@
         (when (and file line col new-name (pos? line) (pos? col))
           {:op "rename" :file (str (fs/absolutize file)) :line (dec line) :character (dec col)
            :new_name new-name :apply apply?})))))
+
+(defn- format-request [args]
+  (let [apply? (boolean (some #{"--apply"} args))
+        [file & more] (remove #{"--apply"} args)]
+    (when (and file (empty? more))
+      {:op "format" :file (str (fs/absolutize file)) :apply apply?})))
 
 (defn- run [roots request timeout-ms]
   (let [results (into [] (mapcat #(client/request-all! % request timeout-ms)) roots)]
@@ -136,6 +148,9 @@
                            :wait wait?}
                           (if wait? wait-timeout-ms request-timeout-ms))))
        "rename" (if-let [request (rename-request args)]
-                  (rename roots request)
+                  (edit-command roots request)
+                  (do (usage) 2))
+       "format" (if-let [request (format-request args)]
+                  (edit-command roots request)
                   (do (usage) 2))
        (do (usage) 2)))))

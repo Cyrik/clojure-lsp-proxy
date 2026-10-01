@@ -350,6 +350,58 @@
 
 (defn uri [proxy path] (str "file://" (:project proxy) "/" path))
 
+(deftest changes-between-brackets-test
+  (let [proxy (start-proxy)]
+    (try
+      (initialize! proxy)
+      (configure! proxy (analysis-config 1100 100))
+      (control! proxy {:op "bash-started" :tool_use_id "before"} 5000)
+      (control! proxy {:op "bash-finished" :tool_use_id "before"} 5000)
+      (doseq [path ["src/a.clj" "src/b.clj"]]
+        (Thread/sleep 1100)
+        (spit (str (fs/path (:project proxy) path)) "(ns externally-edited)\n")
+        ;; The write predates the next bracket's marker by a whole second.
+        (Thread/sleep 1100)
+        (is (= {"ok" true} (control! proxy {:op "bash-started" :tool_use_id path} 5000)))
+        (is (false? (get (control! proxy {:op "status"} 5000) "gate_open")))
+        (wait-for-gate! proxy)
+        (is (= [[(uri proxy path) 2]] (last (sent-uris proxy))))
+        (is (= 0 (get (control! proxy {:op "bash-finished" :tool_use_id path} 5000) "reported"))))
+      (is (= 2 (count (sent-uris proxy))) "both gaps were queued before their checkpoints advanced")
+      (finally
+        (is (= 0 (stop! proxy)))))))
+
+(deftest other-analysis-inputs-invalidate-reported-content-test
+  (doseq [input [:native :explicit]]
+    (let [proxy (start-proxy)
+          file (str (fs/path (:project proxy) "src/a.clj"))
+          restore! (if (= :native input)
+                     #(spit file "(ns a) :A\n")
+                     #(fs/delete-if-exists file))]
+      (try
+        (initialize! proxy)
+        (configure! proxy (analysis-config 1100 100))
+        (control! proxy {:op "bash-started" :tool_use_id "outer"} 5000)
+        (restore!)
+        (control! proxy {:op "bash-started" :tool_use_id "inner"} 5000)
+        (spit file "(ns a) :B\n")
+        (case input
+          :native (do
+                    (send! proxy {"jsonrpc" "2.0" "method" "textDocument/didOpen"
+                                  "params" {"textDocument" {"uri" (uri proxy "src/a.clj")
+                                                            "languageId" "clojure" "version" 1
+                                                            "text" "(ns a) :B\n"}}})
+                    (received! proxy "after-native"))
+          :explicit (changed! proxy ["src/a.clj"] true))
+        (restore!)
+        (is (= 1 (get (control! proxy {:op "bash-finished" :tool_use_id "outer"} 5000) "reported"))
+            (str input " replaced analysis, so restoring the cached disk state must be reported"))
+        (wait-for-gate! proxy)
+        (is (= [[(uri proxy "src/a.clj") (if (= :native input) 2 3)]]
+               (last (sent-uris proxy))))
+        (finally
+          (is (= 0 (stop! proxy))))))))
+
 (deftest bash-bracket-test
   (let [proxy (start-proxy)]
     (initialize! proxy)
@@ -386,9 +438,9 @@
       (spit (str (fs/path (:project proxy) "src" "a.clj")) "(ns a) :by-t5\n")
       (Thread/sleep 1100)
       (control! proxy {:op "bash-started" :tool_use_id "t6"} 5000)
-      (is (= {"ok" true "reported" 1 "queued" false}
+      (is (= {"ok" true "reported" 0 "queued" false}
              (control! proxy {:op "bash-finished" :tool_use_id "t5" :bash_edit_diff nil} 5000))
-          "t5's write, made before t6 started, is still attributed to t5")
+          "t6's start already reported t5's write; t5's finish does not repeat it")
       (is (= 0 (get (control! proxy {:op "bash-finished" :tool_use_id "t6" :bash_edit_diff nil} 5000) "reported")))
       (wait-for-gate! proxy))
     (is (= [[[(uri proxy "src/a.clj") 2]]

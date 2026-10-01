@@ -82,3 +82,21 @@
         response (get-in @state [:own-requests id])]
     (swap! state update :own-requests dissoc id)
     (some-> response (deliver msg))))
+
+(def request-timeout-ms 30000)
+
+(defn request!
+  "The result of the proxy's own request to the server, waited for.
+  Throws with the server's error, or when no answer arrives within
+  `request-timeout-ms`."
+  [proxy method params]
+  (let [response (deref (request-server! proxy method params) request-timeout-ms ::timeout)]
+    (cond
+      (= ::timeout response)
+      (throw (ex-info (str method " got no answer within " request-timeout-ms " ms") {:method method}))
+
+      (get response "error")
+      (throw (ex-info (str method " failed: " (get-in response ["error" "message"]))
+                      {:method method :error (get response "error")}))
+
+      :else (get response "result"))))

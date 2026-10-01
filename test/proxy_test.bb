@@ -160,6 +160,26 @@
     (is (= ["start" "client-eof" "shutdown-response-timeout" "server-killed" "server-exit" "exit"]
            (events (log-entries proxy))))))
 
+(deftest server-fallback-test
+  (testing "a CLOJURE_LSP_PROXY_SERVER path that is not an executable file falls back to clojure-lsp on PATH, logged"
+    (let [bin (str (fs/create-temp-dir {:prefix "clojure-lsp-proxy-bin"}))
+          _ (fs/create-sym-link (fs/path bin "clojure-lsp") fake-server)
+          log (str (fs/create-temp-file {:prefix "clojure-lsp-proxy-test" :suffix ".log"}))
+          proxy {:proc (p/process [launcher]
+                                  {:extra-env {"CLOJURE_LSP_PROXY_SERVER" "/nonexistent/clojure-lsp"
+                                               "CLAUDE_PLUGIN_LSP_LOG_FILE" log
+                                               "PATH" (str bin ":" (fs/parent (fs/which "bb")) ":/usr/bin:/bin")}
+                                   :err :string})
+                 :log log}
+          init (initialize! proxy)]
+      (is (= "fake-server" (get-in init ["result" "serverInfo" "name"])) "the fallback server answered")
+      (.close (:in (:proc proxy)))
+      (is (= 0 (wait-exit proxy 10000)))
+      (let [entries (log-entries proxy)]
+        (is (= "clojure-lsp" (get (first entries) "command")))
+        (is (= {"ignored" "/nonexistent/clojure-lsp" "command" "clojure-lsp"}
+               (select-keys (first (filter #(= "server-fallback" (get % "event")) entries)) ["ignored" "command"])))))))
+
 (let [{:keys [fail error]} (run-tests 'proxy-test)]
   (shutdown-agents)
   (System/exit (+ fail error)))

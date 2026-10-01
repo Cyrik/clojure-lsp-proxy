@@ -23,10 +23,11 @@ and hooks run, `src/` the Babashka code, `test/` the suites (`bb test`).
   the proxy's own arguments and proxies stdio.
 - `bin/clojure-lsp-proxy`: the command line over the control socket
   (`status`, `changed [--wait] <path>...`, `rename`).
-- `skills/clojure-rename/SKILL.md`: tells Claude to use the rename command
-  instead of editing call sites by hand.
-- `src/clojure_lsp_proxy/rename.clj`: rename through the running
-  clojure-lsp and application of the resulting workspace edit.
+- `skills/clojure-rename/SKILL.md`, `skills/clojure-format/SKILL.md`: tell
+  Claude to use the rename and format commands instead of editing by hand.
+- `src/clojure_lsp_proxy/rename.clj`, `format.clj`: rename and formatting
+  through the running clojure-lsp; `edit.clj` applies the resulting
+  workspace edit, reports the touched files and waits for the analysis.
 - `bin/on-bash-start`, `bin/on-bash-end`, `hooks/hooks.json`: the Claude
   Code hooks around every Bash command (PreToolUse, PostToolUse and
   PostToolUseFailure).
@@ -48,24 +49,65 @@ and hooks run, `src/` the Babashka code, `test/` the suites (`bb test`).
 
 ## Running it
 
-During development, start Claude Code in a Clojure project with the plugin
-loaded in place:
+The repository is its own marketplace (`.claude-plugin/marketplace.json`,
+one plugin with source `./`). Installed once with
 
 ```
-claude --plugin-dir /Users/lukas/Workspace/clojure/clojure-lsp-proxy
+claude plugin marketplace add /Users/lukas/Workspace/clojure/clojure-lsp-proxy
+claude plugin install clojure-lsp-proxy@clojure-lsp-proxy
 ```
+
+every new session loads it, whatever started Claude Code. A relative-path
+plugin of a directory marketplace runs in place: the proxy's `start` event
+logs `CLAUDE_PLUGIN_ROOT` as this repository, so an edit here is live in
+the next session; `claude plugin update` only acts on a version change.
+For a one-off session, `claude --plugin-dir <this repository>` works too
+and registers before any installed plugin.
+
+Only one plugin may serve `.clj`: Claude Code gives each extension to the
+first LSP server registered and logs the losers under `--debug`
+("extension .clj already handled by ..."). Among installed plugins
+`clojure-lsp-cc` registers before this one, so it is disabled
+(`claude plugin disable clojure-lsp-cc@clojure-lsp-cc`).
 
 `.lsp.json` sets `startupTimeout` to five minutes because clojure-lsp runs
-the whole project analysis before it answers `initialize`, and points
-`CLOJURE_LSP_PROXY_SERVER` at the clojure-lsp fork that reports watched-file
-analysis as work-done progress. A project that also enables the
-`clojure-lsp-cc` plugin should disable it while testing so that only one
-server claims `.clj`.
+the whole project analysis before it answers `initialize`.
+
+## The server
+
+The proxy runs `CLOJURE_LSP_PROXY_SERVER` when that variable is set (a
+path, or a command on PATH), else `clojure-lsp` on PATH. A path that is
+not an executable file is ignored: the proxy logs `server-fallback` and
+runs `clojure-lsp` from PATH, so a stale setting degrades instead of
+failing to start. Claude Code sets the variable for every session from
+the `env` block of `~/.claude/settings.json`:
+
+```
+"env": { "CLOJURE_LSP_PROXY_SERVER": "/path/to/clojure-lsp/clojure-lsp" }
+```
+
+The gate needs the clojure-lsp fork that reports watched-file analysis as
+work-done progress (upstream PR
+[clojure-lsp#2474](https://github.com/clojure-lsp/clojure-lsp/pull/2474),
+open). Until that is merged and released, build it:
+
+```
+git clone https://github.com/Cyrik/clojure-lsp.git
+cd clojure-lsp && git checkout Cyrik/watched-files-progress
+bb prod-cli
+```
+
+and point the variable at the `clojure-lsp` launcher it produces. With
+stock clojure-lsp instead, navigation works but no analysis progress ever
+arrives: every reported change holds the client's requests for the full
+deadline (default 30 s), the log says so (`send-dropped` with a hint), and
+rename and format are refused after the first change report because no
+analysis confirms it.
 
 The traffic log is a JSONL file at
 `~/.cache/clojure-lsp-proxy/<sha1 of the project root>/<proxy pid>.log`, or
-at `CLAUDE_PLUGIN_LSP_LOG_FILE` when Claude Code sets it
-(`claude --enable-lsp-logging`). Every line has `t` and `ms` (wall-clock
+at `CLAUDE_PLUGIN_LSP_LOG_FILE` when that variable is set (the test suites
+set it; the current CLI has no flag for it). Every line has `t` and `ms` (wall-clock
 time), a `dir` (`c->s`, `s->c` for forwarded messages; `p->s`, `s->p` for
 messages the proxy itself sends or consumes; `proxy` for its own events;
 `server-stderr` for the server's stderr lines) and, for messages, `method`,
@@ -80,7 +122,10 @@ Proxy events in the log (`dir` `proxy`, field `event`): `gate-close`,
 (with its `reason`: `analysis-end`, `deadline` or `shutdown`), `gate-open`
 (with `closed-ms` and the number of `released` messages), `anomaly` (a
 progress `create` that cannot belong to the send in flight), `send-dropped`
-(no analysis by the deadline, or no end), `resend-unconfirmed`, plus the
+(no analysis by the deadline, with a hint that the server may not be the
+fork, or no end), `resend-unconfirmed`, `rename-applied`, `format-applied`,
+`server-fallback` (a `CLOJURE_LSP_PROXY_SERVER` path that is not an
+executable file), plus the
 lifecycle events `start`, `client-eof`, `server-exit`, `terminated`,
 `exit`. A released message is logged with its `held-ms`.
 
@@ -92,9 +137,11 @@ ignored with a warning.
 
 Claude's `Edit` and `Write` tools need nothing: Claude Code's LSP client
 sends `didOpen`, `didChange` and `didSave` for them. For the Bash tool, the
-plugin's PreToolUse hook sends `bash-started` and the proxy snapshots the
-project's git state (a marker time, `git status`, HEAD); the PostToolUse
-and PostToolUseFailure hooks send `bash-finished` with the `bashEditDiff`
+plugin's PreToolUse hook sends `bash-started` and the proxy checks the
+project's git state (a marker time, `git status`, HEAD) against the previous
+checkpoint, queues changes made between commands, and saves the new
+snapshot for the bracket; the PostToolUse and PostToolUseFailure hooks
+send `bash-finished` with the `bashEditDiff`
 Claude Code recorded, and the proxy unions that with its own check against
 the snapshot: paths new to the status listing, paths rewritten or removed
 since the marker, paths that left the listing because a stash, checkout or
@@ -105,15 +152,21 @@ result goes through the C4 filter and into the send queue, and the hook
 returns as soon as the report is queued. Snapshots are keyed by Claude
 Code's `tool_use_id`, since parallel Bash calls interleave their hooks; a
 finish whose start never arrived uses the previous check's snapshot, or
-the one taken at startup.
+the one taken at startup. Checks at Bash start, Bash finish and before
+rename share a checkpoint. Each scan and report is serialized with the
+checkpoint update, so overlapping brackets cannot advance it past an
+unreported interval. Analysis runs independently of these checks.
+Content fingerprints of reported files suppress duplicate reports from
+overlapping checks; the proxy does not hash the whole project.
 
 Set `bashEditDiffEnabled` to `true` in `~/.claude/settings.json` so that
 Claude Code records its diff in every permission mode; without it the git
-check still catches everything git can see. Known gaps: writes made by a
-background Bash command after its hook fired, or by anything else between
-two brackets, are not reported (at the next bracket's start the file is
-already dirty with an old modification time); files git ignores are never
-reported, even a gitignored `.clj` under a source path that clojure-lsp
+check catches git-visible changes made between commands by the next Bash
+start or rename, including writes from editors and background commands.
+Known gaps: native LSP queries before that next check can still see stale
+analysis; automatic disk checks do not cover projects outside git;
+files git ignores are never discovered by the git check, even a
+gitignored `.clj` under a source path that clojure-lsp
 analyzed at startup; nested repositories show up as one untracked
 directory; a file written in the same second as a snapshot may be reported
 once more than necessary.
@@ -136,15 +189,25 @@ clojure-lsp-proxy rename --symbol <ns> <new.ns> [--apply]
 The proxy asks the running clojure-lsp for the rename; for a namespace it
 also asks `workspace/willRenameFiles` for the `ns` form and `:require`
 edits that go with the file move, as an editor does. Lines and columns
-are one-based. Without `--apply` the edits are printed and nothing
+are one-based. `--symbol` resolves vars and namespaces through
+`workspace/symbol`; keywords and locals have no workspace symbol and take
+the position form. Before asking for the rename the proxy asks
+`clojure/cursorInfo/raw` what sits at the position and refuses the key of
+a destructuring map (`:keys`, `:syms`, `:strs`, qualified or not), which
+clj-kondo marks as such; its rename would be one edit that breaks the
+destructuring instead of renaming anything. The same spelling in plain
+data, `{:api/keys [1 2]}`, carries no mark and is renamed. Without
+`--apply` the edits are printed and nothing
 changes. With `--apply` the proxy applies them (text edits from the last
 position backwards, then file operations), reports every touched path
 through C4, waits for the re-analysis and then replies; the command line
 also tells every other proxy of the project about the touched files. A
 file rename or creation that would overwrite an existing file fails before
-anything is written. Before asking clojure-lsp for the edits, the rename
-waits until every change the proxy reported has been analyzed (the gate's
-sends are settled; `status` shows this as `settled`), at most two
+anything is written. Before asking clojure-lsp for the edits, both dry-run
+and applied rename check for git-visible disk changes since the shared
+checkpoint and queue them. The rename then waits until every change the
+proxy reported has been analyzed (the gate's sends are settled; `status`
+shows this as `settled`), at most two
 deadlines, and is refused when they are not. An open gate is not enough:
 after a deadline released the held messages, the analysis of a reported
 change may still be running. A send that got no analysis by its deadline,
@@ -154,8 +217,20 @@ once a send ends on its analysis. With a server that reports no progress
 for watched-file changes (stock clojure-lsp, or
 `:compute-external-file-changes false`) nothing ever confirms, so the
 rename stays refused after the first change report: the fork with default
-settings is required. The proxy cannot vouch for changes it never saw,
-such as a write between two Bash brackets.
+settings is required. The disk check is a point-in-time check: writes made
+after it, ignored files and files outside git are not covered by it.
+
+## Format
+
+```
+clojure-lsp-proxy format <file> [--apply]
+```
+
+The file's `textDocument/formatting` edits from the running clojure-lsp,
+cljfmt with the project's settings as clojure-lsp reads them. Without
+`--apply` they are printed; with `--apply` they go through the same path
+as a rename: checked before writing, reported, waited for. A file that is
+already formatted yields no edits and is not written. Whole files only.
 
 ## Contracts
 
@@ -254,8 +329,19 @@ such as a write between two Bash brackets.
   checked for an existing target, before anything is written; a failure
   while writing leaves the files written so far in place, and those paths
   are still reported. A rename applied inside a Bash command's bracket is
-  not reported again by that bracket, unless the command changed the file
-  again afterwards.
+  not reported again by that bracket, unless the file was written again
+  afterwards, even with the same content. `--symbol` names a var or a
+  namespace; keywords and locals are renamed by position. A rename aimed
+  at the key of a destructuring map (`:keys`, `:syms`, `:strs`, qualified
+  or not, as clj-kondo marks them) is refused before anything is
+  requested; the same spelling in plain data is renamed.
+- C8 Format. `format <file>` asks the running clojure-lsp for the file's
+  `textDocument/formatting` edits. Without `--apply` the CLI prints them
+  and changes nothing; with `--apply` they go through C7's path: checked
+  before writing, reported through C4, waited for per C3, and not reported
+  again by the Bash bracket around the command. A file without edits is
+  not written. Like rename, format waits for every reported change to be
+  analyzed first.
 
 ## Development
 

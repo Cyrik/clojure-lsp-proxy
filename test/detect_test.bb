@@ -135,6 +135,28 @@
         (git! root "mv" "src/b.clj" "src/renamed.clj")
         (is (= #{} (check root (fn [] (git! root "commit" "-q" "-m" "mv")))))))))
 
+(deftest reported-state-test
+  (with-temp-repo
+    (fn [root]
+      (let [path (str (fs/path root "src/a.clj"))
+            reported (detect/reported-state path)]
+        (testing "untouched since the report"
+          (is (detect/as-reported? reported path)))
+        (testing "rewritten with the same bytes: a write happened, so the analysis may have seen something else in between"
+          (Thread/sleep 5)
+          (spit path (slurp path))
+          (is (not (detect/as-reported? reported path))))
+        (testing "a different content"
+          (spit path "(ns a) :other\n")
+          (is (not (detect/as-reported? (detect/reported-state path) (str (fs/path root "src/b.clj"))))))
+        (testing "a path reported as absent stays as reported while it is absent"
+          (let [gone (str (fs/path root "src/nope.clj"))
+                reported (detect/reported-state gone)]
+            (is (= :absent (:state reported)))
+            (is (detect/as-reported? reported gone))
+            (spit gone "(ns nope)\n")
+            (is (not (detect/as-reported? reported gone)))))))))
+
 (deftest same-second-write-test
   (with-temp-repo
     (fn [root]

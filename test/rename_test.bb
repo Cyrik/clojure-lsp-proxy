@@ -10,9 +10,9 @@
             [clojure.test :refer [deftest is run-tests testing]]
             [clojure-lsp-proxy.client :as client]
             [clojure-lsp-proxy.control :as control]
+            [clojure-lsp-proxy.edit :as edit]
             [clojure-lsp-proxy.framing :as framing]
-            [clojure-lsp-proxy.project :as project]
-            [clojure-lsp-proxy.rename :as rename])
+            [clojure-lsp-proxy.project :as project])
   (:import [java.util.concurrent TimeUnit]))
 
 (def root (str (fs/parent (fs/parent (fs/canonicalize *file*)))))
@@ -25,24 +25,29 @@
 (deftest apply-text-edits-test
   (testing "edits apply from the end so that earlier offsets stay valid"
     (is (= "(ns a)\n\n(defn yell [] (yell))\n"
-           (rename/apply-text-edits "(ns a)\n\n(defn shout [] (shout))\n"
+           (edit/apply-text-edits "(ns a)\n\n(defn shout [] (shout))\n"
                                     [{"range" (range* 2 6 2 11) "newText" "yell"}
                                      {"range" (range* 2 16 2 21) "newText" "yell"}]))))
   (testing "multibyte text before an edit does not shift it, since positions count UTF-16 units"
-    (is (= "λ yell" (rename/apply-text-edits "λ shout" [{"range" (range* 0 2 0 7) "newText" "yell"}]))))
+    (is (= "λ yell" (edit/apply-text-edits "λ shout" [{"range" (range* 0 2 0 7) "newText" "yell"}]))))
   (testing "an edit spanning lines"
-    (is (= "a\nX\nd" (rename/apply-text-edits "a\nb\nc\nd" [{"range" (range* 1 0 2 1) "newText" "X"}])))))
+    (is (= "a\nX\nd" (edit/apply-text-edits "a\nb\nc\nd" [{"range" (range* 1 0 2 1) "newText" "X"}])))))
 
 ;;; end to end
 
 (defn start-proxy
   ([] (start-proxy {}))
-  ([{:keys [deadline-ms] :or {deadline-ms 30000}}]
+  ([{:keys [deadline-ms git?] :or {deadline-ms 30000}}]
   (let [project (str (fs/canonicalize (fs/create-temp-dir {:prefix "clojure-lsp-proxy-rename"})))
         log (str (fs/path project "proxy.log"))]
     (fs/create-dirs (fs/path project "src" "live"))
     (spit (str (fs/path project "src" "live" "util.clj")) "(ns live.util)\n\n(defn shout [s]\n  (str s \"!\"))\n")
     (spit (str (fs/path project "src" "live" "core.clj")) "(ns live.core\n  (:require [live.util :as util]))\n\n(defn greet [n]\n  (util/shout n))\n")
+    (when git?
+      (p/shell {:dir project :out :string :err :string} "git" "init" "-q")
+      (p/shell {:dir project :out :string :err :string} "git" "add" "src")
+      (p/shell {:dir project :out :string :err :string}
+               "git" "-c" "user.name=Test" "-c" "user.email=test@example.com" "commit" "-qm" "base"))
     (let [proc (p/process [launcher]
                           {:extra-env {"CLOJURE_LSP_PROXY_SERVER" fake-server
                                        "CLAUDE_PLUGIN_LSP_LOG_FILE" log
@@ -100,6 +105,53 @@
                       {"textDocument" {"uri" (uri proxy "src/live/core.clj") "version" nil}
                        "edits" [{"range" (range* 4 8 4 13) "newText" "yell"}]}]})
 
+(deftest rename-reconciles-external-edits-test
+  (doseq [apply? [false true]]
+    (let [proxy (start-proxy {:git? true})
+          file (str (fs/path (:project proxy) "src/live/core.clj"))]
+      (try
+        (initialize! proxy)
+        (configure! proxy {"progress" {"create_after_ms" 1100 "end_after_ms" 100 "title" "Analyzing external file changes"}
+                           "replies" {"textDocument/rename" (var-rename-edit proxy)}})
+        (Thread/sleep 1100)
+        (spit file (str (slurp file) "\n;; external edit\n"))
+        (Thread/sleep 1100)
+        (let [reply (client/request! (:socket proxy)
+                                     {:op "rename" :file (str (fs/path (:project proxy) "src/live/util.clj"))
+                                      :line 2 :character 6 :new_name "yell" :apply apply?} 10000)
+              entries (mapv json/parse-string (str/split-lines (slurp (:log proxy))))
+              index-of (fn [pred] (first (keep-indexed #(when (pred %2) %1) entries)))
+              end-index (index-of #(and (= "send-end" (get % "event"))
+                                        (= "analysis-end" (get % "reason"))))
+              rename-index (index-of #(= "textDocument/rename" (get % "method")))]
+          (is (true? (get reply "ok")))
+          (is (= apply? (get reply "applied")))
+          (is (and end-index rename-index (< end-index rename-index))
+              "external changes finish analysis before either dry-run or applied rename requests edits")
+          (is (= [{"uri" (uri proxy "src/live/core.clj") "type" 2}]
+                 (get-in (first (filter #(= "workspace/didChangeWatchedFiles" (get % "method")) entries))
+                         ["body" "params" "changes"])))
+          (is (str/includes? (slurp file) ";; external edit"))
+          (is (str/includes? (text proxy "src/live/util.clj") (if apply? "yell" "shout"))))
+        (finally
+          (is (= 0 (stop! proxy))))))))
+
+(deftest rename-refuses-unconfirmed-external-edit-test
+  (let [proxy (start-proxy {:git? true :deadline-ms 1500})]
+    (try
+      (initialize! proxy)
+      (configure! proxy {"replies" {"textDocument/rename" (var-rename-edit proxy)}})
+      (spit (str (fs/path (:project proxy) "src/live/core.clj")) "(ns live.core)\n")
+      (let [reply (client/request! (:socket proxy)
+                                   {:op "rename" :file (str (fs/path (:project proxy) "src/live/util.clj"))
+                                    :line 2 :character 6 :new_name "yell" :apply true} 10000)
+            entries (mapv json/parse-string (str/split-lines (slurp (:log proxy))))]
+        (is (false? (get reply "ok")))
+        (is (not-any? #(= "textDocument/rename" (get % "method")) entries))
+        (is (str/includes? (text proxy "src/live/util.clj") "shout")))
+      (finally
+        (is (= 0 (stop! proxy)))))))
+
 (deftest rename-var-test
   (let [proxy (start-proxy)]
     (initialize! proxy)
@@ -132,8 +184,8 @@
       (is (= #{[(uri proxy "src/live/util.clj") 2] [(uri proxy "src/live/core.clj") 2]}
              (into #{} (map (juxt #(get % "uri") #(get % "type"))) (get-in sent ["body" "params" "changes"])))
           "both touched files were reported as changed")
-      (is (= "clojure-lsp-proxy/textDocument/rename/1"
-             (get (first (filter #(= "textDocument/rename" (get % "method")) entries)) "id"))
+      (is (str/starts-with? (get (first (filter #(= "textDocument/rename" (get % "method")) entries)) "id")
+                            "clojure-lsp-proxy/textDocument/rename/")
           "the rename was the proxy's own request"))
     (is (= 0 (stop! proxy)))))
 
@@ -336,6 +388,74 @@
         (is (<= 1100 (- (System/currentTimeMillis) t0)) "answered after the re-sent analysis ended")
         (is (= 2 (count (filter #{"resend-unconfirmed"} (events)))))
         (is (= {"settled" true "unconfirmed_paths" 0 "in_flight" false "gate_open" true} (status! proxy)))))
+    (is (= 0 (stop! proxy)))))
+
+(deftest destructuring-key-is-refused-test
+  (let [proxy (start-proxy)
+        path (str (fs/path (:project proxy) "src/live/core.clj"))
+        source "(ns live.core)\n\n(defn greet [{:user/keys [name]}]\n  (str \"hi \" name :user/greeting))\n"
+        rename (fn [line character apply?]
+                 (client/request! (:socket proxy) {:op "rename" :file path :line line :character character
+                                                   :new_name "account" :apply apply?} 10000))]
+    (spit path source)
+    (initialize! proxy)
+    (testing "a destructuring key is refused before the rename is requested"
+      (configure! proxy {"replies" {"clojure/cursorInfo/raw" {"elements" [{"element" {"name" "keys" "ns" "user" "bucket" "keyword-usages"
+                                                                                       "keys-destructuring-ns-modifier" true}}]}
+                                    "textDocument/rename" (var-rename-edit proxy)}})
+      (let [reply (rename 2 16 true)]
+        (is (false? (get reply "ok")))
+        (is (str/includes? (get reply "error") ":user/keys is a destructuring key"))
+        (is (empty? (filter #(= "textDocument/rename" (get % "method")) (log-entries proxy))) "nothing was requested")
+        (is (= source (text proxy "src/live/core.clj")) "nothing was written")))
+    (testing "the same spelling as plain data passes: no marker on its element"
+      (configure! proxy {"replies" {"clojure/cursorInfo/raw" {"elements" [{"element" {"name" "keys" "ns" "api" "bucket" "keyword-usages"}}]}}})
+      (let [reply (rename 3 20 false)]
+        (is (true? (get reply "ok")))
+        (is (= 1 (count (filter #(= "textDocument/rename" (get % "method")) (log-entries proxy)))))))
+    (testing "--symbol does not resolve keywords and says what to do instead"
+      (let [reply (client/request! (:socket proxy) {:op "rename" :symbol ":live/greeting" :new_name "x" :apply false} 10000)]
+        (is (false? (get reply "ok")))
+        (is (str/includes? (get reply "error") "position form"))))
+    (is (= 0 (stop! proxy)))))
+
+(deftest format-test
+  (let [proxy (start-proxy)
+        path (str (fs/path (:project proxy) "src/live/util.clj"))
+        unformatted "(ns live.util)\n\n(defn shout [s]\n(str s \"!\"))\n"
+        formatted "(ns live.util)\n\n(defn shout [s]\n  (str s \"!\"))\n"
+        ;; clojure-lsp answers with one edit replacing the whole document, its end far past it
+        edits [{"range" (range* 0 0 999999 999999) "newText" formatted}]
+        clamped [{"range" (range* 0 0 4 0) "newText" formatted}]
+        format! (fn [file apply?] (client/request! (:socket proxy) {:op "format" :file file :apply apply?} 70000))]
+    (spit path unformatted)
+    (initialize! proxy)
+    (configure! proxy {"progress" {"create_after_ms" 1100 "end_after_ms" 100 "title" "Analyzing external file changes"}
+                       "replies" {"textDocument/formatting" edits}})
+    (testing "dry run returns the edits and changes nothing"
+      (let [reply (format! path false)]
+        (is (= {"ok" true "applied" false "summary" {"files" 1 "edits" 1 "renamed_files" 0}} (dissoc reply "edit")))
+        (is (= clamped (get-in reply ["edit" "documentChanges" 0 "edits"])) "the end position is clamped to the document")
+        (is (= unformatted (text proxy "src/live/util.clj")))))
+    (testing "apply writes the file, reports it and waits for the analysis"
+      (let [t0 (System/currentTimeMillis)
+            reply (format! path true)]
+        (is (= {"ok" true "applied" true "timed_out" false "touched" [path]} (dissoc reply "edit" "summary")))
+        (is (= formatted (text proxy "src/live/util.clj")))
+        (is (<= 1100 (- (System/currentTimeMillis) t0)) "answered after the re-analysis")
+        (let [entries (log-entries proxy)]
+          (is (= (uri proxy "src/live/util.clj")
+                 (get-in (first (filter #(= "textDocument/formatting" (get % "method")) entries)) ["body" "params" "textDocument" "uri"])))
+          (is (some #(= "format-applied" (get % "event")) entries))
+          (is (= [#{(uri proxy "src/live/util.clj")}] (sent-uris proxy)) "the formatted file was reported"))))
+    (testing "an already formatted file yields no edits and nothing is written"
+      (configure! proxy {"replies" {"textDocument/formatting" []}})
+      (is (= {"ok" true "applied" true "touched" [] "timed_out" false "summary" {"files" 1 "edits" 0 "renamed_files" 0}}
+             (dissoc (format! path true) "edit"))))
+    (testing "a missing file is an error"
+      (let [reply (format! (str (fs/path (:project proxy) "src/live/nope.clj")) false)]
+        (is (false? (get reply "ok")))
+        (is (str/includes? (get reply "error") "no such file"))))
     (is (= 0 (stop! proxy)))))
 
 (let [{:keys [fail error]} (run-tests 'rename-test)]

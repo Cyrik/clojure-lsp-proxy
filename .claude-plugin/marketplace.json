@@ -1,0 +1,17 @@
+{
+  "name": "clojure-lsp-proxy",
+  "owner": {
+    "name": "Lukas Domagala"
+  },
+  "metadata": {
+    "description": "clojure-lsp behind a proxy for Claude Code: Bash-made changes reach the analysis, and rename works through the CLI."
+  },
+  "plugins": [
+    {
+      "name": "clojure-lsp-proxy",
+      "version": "0.1.0",
+      "source": "./",
+      "description": "Runs clojure-lsp behind a proxy that reports Bash-made file changes to it, holds queries until they are analyzed, and applies renames."
+    }
+  ]
+}
