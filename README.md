@@ -83,26 +83,29 @@ failing to start. Claude Code sets the variable for every session from
 the `env` block of `~/.claude/settings.json`:
 
 ```
-"env": { "CLOJURE_LSP_PROXY_SERVER": "/path/to/clojure-lsp/clojure-lsp" }
+"env": { "CLOJURE_LSP_PROXY_SERVER": "/Users/you/.local/share/clojure-lsp-nightly/clojure-lsp" }
 ```
 
-The gate needs the clojure-lsp fork that reports watched-file analysis as
-work-done progress (upstream PR
-[clojure-lsp#2474](https://github.com/clojure-lsp/clojure-lsp/pull/2474),
-open). Until that is merged and released, build it:
+The gate needs a clojure-lsp that reports watched-file analysis as
+work-done progress: any build of master from 2026-10-05 on
+([clojure-lsp#2474](https://github.com/clojure-lsp/clojure-lsp/pull/2474),
+merged), so the next release and every nightly since. clojure-lsp
+publishes a nightly (a native image) for every commit on master; its
+install script fetches the newest one, without sudo when given a
+directory:
 
 ```
-git clone https://github.com/Cyrik/clojure-lsp.git
-cd clojure-lsp && git checkout Cyrik/watched-files-progress
-bb prod-cli
+curl -O https://raw.githubusercontent.com/clojure-lsp/clojure-lsp/master/install
+chmod +x install && ./install --version nightly --dir ~/.local/share/clojure-lsp-nightly
 ```
 
-and point the variable at the `clojure-lsp` launcher it produces. With
-stock clojure-lsp instead, navigation works but no analysis progress ever
-arrives: every reported change holds the client's requests for the full
-deadline (default 30 s), the log says so (`send-dropped` with a hint), and
-rename and format are refused after the first change report because no
-analysis confirms it.
+Point the variable at the `clojure-lsp` it installs (a directory off PATH
+leaves the release in place for other tools); rerunning the script
+upgrades. With an older clojure-lsp instead, navigation works but no
+analysis progress ever arrives: every reported change holds the client's
+requests for the full deadline (default 30 s), the log says so
+(`send-dropped` with a hint), and rename and format are refused after the
+first change report because no analysis confirms it.
 
 The traffic log is a JSONL file at
 `~/.cache/clojure-lsp-proxy/<sha1 of the project root>/<proxy pid>.log`, or
@@ -122,8 +125,9 @@ Proxy events in the log (`dir` `proxy`, field `event`): `gate-close`,
 (with its `reason`: `analysis-end`, `deadline` or `shutdown`), `gate-open`
 (with `closed-ms` and the number of `released` messages), `anomaly` (a
 progress `create` that cannot belong to the send in flight), `send-dropped`
-(no analysis by the deadline, with a hint that the server may not be the
-fork, or no end), `resend-unconfirmed`, `rename-applied`, `format-applied`,
+(no analysis by the deadline, with a hint that the server may predate the
+progress reports, or no end), `resend-unconfirmed`, `rename-applied`,
+`format-applied`,
 `server-fallback` (a `CLOJURE_LSP_PROXY_SERVER` path that is not an
 executable file), plus the
 lifecycle events `start`, `client-eof`, `server-exit`, `terminated`,
@@ -214,11 +218,12 @@ change may still be running. A send that got no analysis by its deadline,
 or whose analysis never ended, leaves its changes unconfirmed (`status`:
 `unconfirmed_paths`); the rename re-sends them first and proceeds only
 once a send ends on its analysis. With a server that reports no progress
-for watched-file changes (stock clojure-lsp, or
+for watched-file changes (clojure-lsp before 2026-10-05, or
 `:compute-external-file-changes false`) nothing ever confirms, so the
-rename stays refused after the first change report: the fork with default
-settings is required. The disk check is a point-in-time check: writes made
-after it, ignored files and files outside git are not covered by it.
+rename stays refused after the first change report: a current clojure-lsp
+with default settings is required. The disk check is a point-in-time
+check: writes made after it, ignored files and files outside git are not
+covered by it.
 
 ## Format
 
@@ -349,6 +354,6 @@ already formatted yields no edits and is not written. Whole files only.
 temporary git repositories) and three end-to-end suites, which start the
 proxy as a subprocess in front of `test/fake_server.bb` and play the client
 on its stdio; the gate suite also drives the control socket and the hook
-scripts, the rename suite uses canned server answers and checks the files. The fake server emulates the fork's progress sequence on request
+scripts, the rename suite uses canned server answers and checks the files. The fake server emulates clojure-lsp's progress sequence on request
 (`create` after the debounce, `begin`, `end`), so the suites take about a
 minute of real waiting.

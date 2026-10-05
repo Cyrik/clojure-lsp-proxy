@@ -220,7 +220,7 @@
     (apply transport/log-event! proxy "send-dropped"
            (cond-> [:send (:id in-flight) :reason reason :duration-ms (- (now) (:sent-ms in-flight))]
              (= "no-analysis" reason)
-             (conj :hint "no analysis progress arrived; is the server the clojure-lsp fork that reports watched-file analysis (README, Installing)?")))
+             (conj :hint "no analysis progress arrived; does the server report watched-file analysis (clojure-lsp master from 2026-10-05 on, a nightly or the next release; README, The server)?")))
     (swap! state #(-> %
                       (assoc :in-flight nil)
                       (update :unconfirmed merge (:changes in-flight))))))

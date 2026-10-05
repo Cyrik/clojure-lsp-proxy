@@ -6,7 +6,7 @@
 ;; is available through the `fake/received` request. Prints one line to
 ;; stderr on start so that the stderr pump can be observed.
 ;;
-;; Work-done progress, emulating the clojure-lsp fork: `fake/configure`
+;; Work-done progress, emulating clojure-lsp: `fake/configure`
 ;; with `{"progress": {"create_after_ms": N, "end_after_ms": N or null,
 ;; "title": T}}` (or a list of such maps, each run) makes every
 ;; `workspace/didChangeWatchedFiles` start a progress sequence: a `window/workDoneProgress/create` request after the
