@@ -6,11 +6,12 @@
     clojure-lsp-proxy rename <file> <line> <col> <new-name> [--apply]
     clojure-lsp-proxy rename --symbol <ns/name or ns> <new-name> [--apply]
     clojure-lsp-proxy format <file> [--apply]
+    clojure-lsp-proxy clean-ns <file> [--apply]
 
-  `rename` and `format` print the edits clojure-lsp proposes and change
-  nothing; with `--apply` the proxy applies them and tells every other
-  proxy of the project about the touched files. Lines and columns are
-  one-based, as editors show them.
+  `rename`, `format` and `clean-ns` print the edits clojure-lsp proposes
+  and change nothing; with `--apply` the proxy applies them and tells
+  every other proxy of the project about the touched files. Lines and
+  columns are one-based, as editors show them.
 
   Proxies are found under `CLAUDE_PROJECT_DIR` when it is set (Claude Code
   sets it for its Bash tool); otherwise under the current directory and
@@ -52,7 +53,8 @@
     (println "       clojure-lsp-proxy changed [--wait] <path>...")
     (println "       clojure-lsp-proxy rename <file> <line> <col> <new-name> [--apply]")
     (println "       clojure-lsp-proxy rename --symbol <ns/name or ns> <new-name> [--apply]")
-    (println "       clojure-lsp-proxy format <file> [--apply]")))
+    (println "       clojure-lsp-proxy format <file> [--apply]")
+    (println "       clojure-lsp-proxy clean-ns <file> [--apply]")))
 
 (defn- shown-path
   "A file URI as a path relative to the current directory."
@@ -61,8 +63,9 @@
 
 (defn- print-edit
   "The edit as people read it: each file with its edits, then the file
-  operations, then the summary."
-  [{:strs [edit summary applied touched]}]
+  operations, then the summary, then a warning when the analysis of an
+  applied edit was not confirmed within the proxy's wait."
+  [{:strs [edit summary applied touched timed_out]}]
   (doseq [{:strs [kind textDocument edits oldUri newUri uri]} (get edit "documentChanges")]
     (case kind
       nil (do (println (shown-path (get textDocument "uri")))
@@ -76,10 +79,12 @@
   (println (str (if applied "applied: " "dry run: ")
                 (get summary "edits") " edits in " (get summary "files") " files, "
                 (get summary "renamed_files") " files renamed"
-                (when applied (str "; " (count touched) " paths reported")))))
+                (when applied (str "; " (count touched) " paths reported"))))
+  (when timed_out
+    (println "analysis not confirmed: clojure-lsp did not confirm its analysis of the written files within the wait. The next edit command first waits for that analysis, re-sending the changes if no analysis is running, and is refused if it is still not confirmed within two deadlines.")))
 
 (defn- edit-command
-  "Sends an edit-producing request (rename, format) to the first proxy
+  "Sends an edit-producing request (rename, format, refactor) to the first proxy
   that answers, prints the edit and, when it was applied, tells the other
   proxies of the project about the touched files."
   [roots request]
@@ -122,6 +127,13 @@
     (when (and file (empty? more))
       {:op "format" :file (str (fs/absolutize file)) :apply apply?})))
 
+(defn- clean-ns-request
+  "clojure-lsp's clean-ns ignores the position, so the request always
+  carries 0:0."
+  [args]
+  (when-let [{:keys [file apply]} (format-request args)]
+    {:op "refactor" :command "clean-ns" :file file :line 0 :character 0 :args [] :apply apply}))
+
 (defn- run [roots request timeout-ms]
   (let [results (into [] (mapcat #(client/request-all! % request timeout-ms)) roots)]
     (doseq [{:keys [socket reply]} results]
@@ -153,4 +165,7 @@
        "format" (if-let [request (format-request args)]
                   (edit-command roots request)
                   (do (usage) 2))
+       "clean-ns" (if-let [request (clean-ns-request args)]
+                    (edit-command roots request)
+                    (do (usage) 2))
        (do (usage) 2)))))

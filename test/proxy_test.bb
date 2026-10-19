@@ -109,6 +109,26 @@
         (is (= {"code" 0 "expected" true}
                (select-keys (first (filter #(= "server-exit" (get % "event")) entries)) ["code" "expected"])))))))
 
+(deftest spontaneous-apply-edit-crosses-unchanged-test
+  (testing "a workspace/applyEdit the server sends on its own (no command of the proxy in flight) is forwarded both ways"
+    (let [proxy (start-proxy)
+          edit {"documentChanges" [{"textDocument" {"uri" "file:///tmp/blank.clj" "version" 0}
+                                    "edits" [{"range" {"start" {"line" 0 "character" 0} "end" {"line" 0 "character" 0}}
+                                              "newText" "(ns blank)\n"}]}]}]
+      (initialize! proxy)
+      (send! proxy {"jsonrpc" "2.0" "method" "initialized" "params" {}})
+      (send! proxy {"jsonrpc" "2.0" "method" "fake/apply-edit" "params" {"edit" edit}})
+      (let [request (recv! proxy)]
+        (is (= {"method" "workspace/applyEdit" "params" {"edit" edit}} (select-keys request ["method" "params"]))
+            "the client receives the request unchanged")
+        (send! proxy {"jsonrpc" "2.0" "id" (get request "id") "result" {"applied" true}})
+        (send! proxy {"jsonrpc" "2.0" "id" 2 "method" "fake/received"})
+        (is (some #{{"response" (get request "id") "result" {"applied" true}}} (get (recv! proxy) "result"))
+            "the server receives the client's answer"))
+      (.close (:in (:proc proxy)))
+      (is (= 0 (wait-exit proxy 10000)))
+      (is (not-any? #(= "apply-edit-consumed" (get % "event")) (log-entries proxy))))))
+
 (deftest server-crash-test
   (let [proxy (start-proxy)
         init (initialize! proxy)]

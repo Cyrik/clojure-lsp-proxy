@@ -10,7 +10,8 @@ that runs in the same long-lived clojure-lsp.
 Status: all five phases of the plan are implemented: the transparent
 proxy with a traffic log (C1), progress ownership (C2), change injection
 with gating (C3), change reports (C4), the control socket (C5), the hooks
-that bracket every Bash command (C6) and rename (C7).
+that bracket every Bash command (C6) and rename (C7), plus format (C8)
+and clean-ns (C9).
 
 ## Layout
 
@@ -22,12 +23,16 @@ and hooks run, `src/` the Babashka code, `test/` the suites (`bb test`).
   named by `CLOJURE_LSP_PROXY_SERVER` (default `clojure-lsp` on PATH) with
   the proxy's own arguments and proxies stdio.
 - `bin/clojure-lsp-proxy`: the command line over the control socket
-  (`status`, `changed [--wait] <path>...`, `rename`).
-- `skills/clojure-rename/SKILL.md`, `skills/clojure-format/SKILL.md`: tell
-  Claude to use the rename and format commands instead of editing by hand.
+  (`status`, `changed [--wait] <path>...`, `rename`, `format`, `clean-ns`).
+- `skills/clojure-rename/SKILL.md`, `skills/clojure-format/SKILL.md`,
+  `skills/clojure-clean-ns/SKILL.md`: tell Claude to use the rename,
+  format and clean-ns commands instead of editing by hand.
 - `src/clojure_lsp_proxy/rename.clj`, `format.clj`: rename and formatting
-  through the running clojure-lsp; `edit.clj` applies the resulting
-  workspace edit, reports the touched files and waits for the analysis.
+  through the running clojure-lsp; `command.clj`: clojure-lsp refactor
+  commands (`workspace/executeCommand`, so far clean-ns) and the
+  `workspace/applyEdit` the server sends for them; `edit.clj` applies the
+  resulting workspace edit, reports the touched files and waits for the
+  analysis.
 - `bin/on-bash-start`, `bin/on-bash-end`, `hooks/hooks.json`: the Claude
   Code hooks around every Bash command (PreToolUse, PostToolUse and
   PostToolUseFailure).
@@ -127,7 +132,11 @@ Proxy events in the log (`dir` `proxy`, field `event`): `gate-close`,
 progress `create` that cannot belong to the send in flight), `send-dropped`
 (no analysis by the deadline, with a hint that the server may predate the
 progress reports, or no end), `resend-unconfirmed`, `rename-applied`,
-`format-applied`,
+`format-applied`, `clean-ns-applied`, `apply-edit-consumed` (a server
+`workspace/applyEdit` the proxy answered itself during its own command,
+with the `command`; an `anomaly` of kind
+`consumed-edit-differs-from-result` when that edit is not the command's
+result),
 `server-fallback` (a `CLOJURE_LSP_PROXY_SERVER` path that is not an
 executable file), plus the
 lifecycle events `start`, `client-eof`, `server-exit`, `terminated`,
@@ -212,7 +221,11 @@ and applied rename check for git-visible disk changes since the shared
 checkpoint and queue them. The rename then waits until every change the
 proxy reported has been analyzed (the gate's sends are settled; `status`
 shows this as `settled`), at most two
-deadlines, and is refused when they are not. An open gate is not enough:
+deadlines, and is refused when they are not. It is also refused, with
+nothing sent to clojure-lsp, while clojure-lsp has not finished
+`initialize` (`status` shows `server_ready` false). When the wait after
+an applied rename runs out before the re-analysis is confirmed, the
+command line says the analysis is unconfirmed and still exits 0. An open gate is not enough:
 after a deadline released the held messages, the analysis of a reported
 change may still be running. A send that got no analysis by its deadline,
 or whose analysis never ended, leaves its changes unconfirmed (`status`:
@@ -236,6 +249,34 @@ cljfmt with the project's settings as clojure-lsp reads them. Without
 `--apply` they are printed; with `--apply` they go through the same path
 as a rename: checked before writing, reported, waited for. A file that is
 already formatted yields no edits and is not written. Whole files only.
+Like rename, format is refused before clojure-lsp has finished
+`initialize` and reports an unconfirmed analysis when the wait runs out.
+
+## Clean ns
+
+```
+clojure-lsp-proxy clean-ns <file> [--apply]
+```
+
+clojure-lsp's clean-ns refactoring, run as `workspace/executeCommand` in
+the running clojure-lsp: unused requires, refers and imports removed, the
+rest sorted, with the project's clean-ns settings. Without `--apply` the
+new `ns` form is printed; with `--apply` it goes through the same path as
+a rename: checked before writing, reported, waited for. clojure-lsp
+always proposes the whole `ns` form, so an already clean file still shows
+one edit in the dry run; applied, that edit leaves the text as it is, so
+the file is not written and no path is reported. A file without an `ns`
+form gets no edit from clojure-lsp and is refused ("clean-ns proposed no
+edit"). Like rename and format, clean-ns waits for every reported change
+to be analyzed first, is refused before clojure-lsp has finished
+`initialize`, and reports an unconfirmed analysis when the wait after
+applying runs out.
+
+clojure-lsp hands a command's edit to the client as a
+`workspace/applyEdit` request and returns the same edit as the command's
+result. Claude Code does not answer that request, so while one of its own
+commands is in flight the proxy answers it (`applied: false`) instead of
+forwarding it, and applies the result itself.
 
 ## Contracts
 
@@ -243,7 +284,9 @@ already formatted yields no edits and is not written. Whole files only.
   the proxy unchanged except the `initialize` params patch (C2's progress
   capability and, for C7, `workspace.workspaceEdit` with `documentChanges`
   and resource operations, which only the proxy's own requests exercise)
-  and the progress ownership of C2. If the server process dies unexpectedly, the proxy
+  and the progress ownership of C2, and except a server
+  `workspace/applyEdit` that arrives while one of the proxy's own
+  commands is in flight (C9). If the server process dies unexpectedly, the proxy
   answers every held request with an InternalError (-32603) response and
   exits non-zero so that Claude Code's `restartOnCrash` restarts both. After
   a forwarded `exit`, or after the client closes stdin, the proxy exits 0:
@@ -308,7 +351,8 @@ already formatted yields no edits and is not written. Whole files only.
   `~/.cache/clojure-lsp-proxy/<sha1 of the real project root path>/<pid>.sock`
   and removes it on exit. Protocol: one JSON object per line in each
   direction, one request per connection. Operations: `status`,
-  `bash-started`, `bash-finished`, `changed`, `rename`. `bash-started` and
+  `bash-started`, `bash-finished`, `changed`, `rename`, `format`,
+  `refactor`. `bash-started` and
   `bash-finished` reply as soon as the proxy has snapshotted or queued,
   never after analysis; `changed` waits for the gate only when asked.
   Clients address every socket in the project's directory and delete a
@@ -327,9 +371,18 @@ already formatted yields no edits and is not written. Whole files only.
   unless every change the proxy reported has been analyzed within two
   deadlines (C3's sends settled: nothing in flight, pending or
   unconfirmed), so that the edits never come from an analysis behind a
-  reported change. With `--apply` the proxy applies
+  reported change. Before that, the rename is refused with nothing sent
+  to the server while clojure-lsp has not finished `initialize` (the
+  client's `initialized` has not been forwarded; `status`:
+  `server_ready` false). With `--apply` the proxy applies
   the workspace edit to disk, reports the touched paths through C4, waits
-  for that send to end per C3, and then replies. Every text edit is
+  for that send to end per C3, and then replies; when the wait runs out
+  first the reply carries `timed_out` true, and the CLI prints that the
+  analysis was not confirmed and still exits 0: clojure-lsp did not
+  confirm its analysis of the written files within the wait. The next edit
+  command first waits for that analysis, re-sending the changes if no
+  analysis is running, and is refused if it is still not confirmed within
+  two deadlines. Every text edit is
   computed and checked against the file, and every file rename or creation
   checked for an existing target, before anything is written; a failure
   while writing leaves the files written so far in place, and those paths
@@ -345,8 +398,26 @@ already formatted yields no edits and is not written. Whole files only.
   and changes nothing; with `--apply` they go through C7's path: checked
   before writing, reported through C4, waited for per C3, and not reported
   again by the Bash bracket around the command. A file without edits is
-  not written. Like rename, format waits for every reported change to be
-  analyzed first.
+  not written, and neither is one whose edits leave its text unchanged
+  (true of every applied edit, not only format's). Like rename, format
+  waits for every reported change to be analyzed first.
+- C9 Clean ns. `clean-ns <file>` runs clojure-lsp's `clean-ns` command
+  through `workspace/executeCommand` (control op `refactor`). Without
+  `--apply` the CLI prints the edit and changes nothing; with `--apply`
+  the edit goes through C7's path: checked before writing, reported
+  through C4, waited for per C3, and not reported again by the Bash
+  bracket. Like rename, it waits for every reported change to be analyzed
+  first. The proxy runs its own commands one at a time. While one is in
+  flight, a `workspace/applyEdit` request from the server is answered by
+  the proxy with `applied: false` and a `failureReason`, never forwarded,
+  and the edit applied is the command's result; a consumed edit that
+  differs from the result is logged as an anomaly. A
+  `workspace/applyEdit` while no own command is in flight crosses to the
+  client unchanged and its response to the server. A file whose edit
+  leaves its text unchanged (an already clean `ns` form) is not written
+  and not reported. The command is refused when the file does not exist,
+  when clojure-lsp answers with an error, and when it proposes no edit (a
+  file without an `ns` form).
 
 ## Development
 

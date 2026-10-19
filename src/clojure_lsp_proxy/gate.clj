@@ -148,11 +148,20 @@
   [state]
   (and (idle? state) (empty? (:unconfirmed state))))
 
+(defn server-ready?
+  "Whether the client's `initialized` has reached clojure-lsp. Until then
+  clojure-lsp is still inside `initialize`, analyzing the whole project
+  on the thread that handles client requests, so a request sent now
+  waits behind it."
+  [{:keys [state]}]
+  (:server-ready? @state))
+
 (defn snapshot
   "Gate figures for the `status` operation."
   [{:keys [state]}]
-  (let [{:keys [held in-flight pending unconfirmed] :as current} @state]
-    {:held_messages (count held)
+  (let [{:keys [held in-flight pending unconfirmed server-ready?] :as current} @state]
+    {:server_ready server-ready?
+     :held_messages (count held)
      :gate_open (not (closed? current))
      :settled (settled? current)
      :in_flight (some? in-flight)

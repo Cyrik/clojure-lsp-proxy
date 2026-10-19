@@ -6,11 +6,13 @@
   files written so far in place. The touched paths are reported through
   the gate so that clojure-lsp re-reads them, remembered as the proxy's
   own writes so that the Bash bracket around the command does not report
-  them again, and the reply waits for the analysis.
+  them again, and the reply waits for the analysis. A file whose planned
+  text equals its current text is not written.
 
-  The operations that produce edits (rename, format) first wait for every
-  reported change to be analyzed (`await-fresh!`): positions and text
-  computed against an analysis behind a reported change would be wrong."
+  The operations that produce edits (rename, format, refactor commands)
+  first wait for every reported change to be analyzed (`await-fresh!`):
+  positions and text computed against an analysis behind a reported
+  change would be wrong."
   (:require [babashka.fs :as fs]
             [clojure-lsp-proxy.changes :as changes]
             [clojure-lsp-proxy.detect :as detect]
@@ -110,17 +112,22 @@
     (throw (ex-info (str kind " would overwrite " target) {:path target}))))
 
 (defn- planned-text
-  "For a text document edit, the path and the text it will hold; reading
-  and checking happen here, before any write."
+  "For a text document edit, the path, the text it will hold and whether
+  that equals the current text; reading and checking happen here, before
+  any write."
   [{:strs [textDocument edits]}]
-  (let [path (uri->path (get textDocument "uri"))]
-    {:path path :text (apply-text-edits (slurp path) edits)}))
+  (let [path (uri->path (get textDocument "uri"))
+        current (slurp path)
+        text (apply-text-edits current edits)]
+    {:path path :text text :unchanged? (= current text)}))
 
 (defn- apply-operation! [{:strs [kind textDocument edits uri oldUri newUri] :as operation}]
   (case kind
-    nil (let [{:keys [path text]} (:planned operation)]
-          (spit path text)
-          [path])
+    nil (let [{:keys [path text unchanged?]} (:planned operation)]
+          (if unchanged?
+            []
+            (do (spit path text)
+                [path])))
     "rename" (let [from (uri->path oldUri)
                    to (uri->path newUri)]
                (fs/create-dirs (fs/parent to))
@@ -137,7 +144,10 @@
 (defn apply-edit!
   "Applies the edit's operations in order, adding each touched path to
   the `touched` atom as it goes. Every text edit is computed and every
-  file operation checked before the first write."
+  file operation checked before the first write. A text document change
+  that leaves the file's text as it is (clean-ns always proposes its `ns`
+  form, cleaned or not) is skipped: not written, not touched, so not
+  reported either."
   [edit touched]
   (let [operations (mapv (fn [operation]
                            (cond-> operation
@@ -153,8 +163,15 @@
   "Waits until every change the proxy reported has been analyzed, after
   re-sending the changes a dropped send left unconfirmed; throws when they
   are not confirmed within two deadlines. An open gate is not enough, see
-  `gate/await-settled`."
+  `gate/await-settled`.
+
+  Throws at once while clojure-lsp has not finished `initialize`: a
+  request sent then would only queue behind the initial analysis, outlive
+  the proxy's request timeout, and later run anyway, its edit reaching
+  nobody who asked for it."
   [{:keys [send-deadline-ms] :as proxy}]
+  (when-not (gate/server-ready? proxy)
+    (throw (ex-info "clojure-lsp has not finished initializing (analyzing the project); retry once `status` shows server_ready true" {})))
   (gate/resend-unconfirmed! proxy)
   (when-not (gate/await-settled proxy (* 2 send-deadline-ms))
     (throw (ex-info "the analysis of reported changes is not confirmed (still running, or none arrived within the deadline); retry once `status` shows settled" {}))))

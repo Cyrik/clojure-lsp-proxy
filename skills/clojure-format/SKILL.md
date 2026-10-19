@@ -17,11 +17,16 @@ Dry run first, then apply:
 ```
 
 Without `--apply` the command prints the edits and changes nothing. With
-`--apply` it writes the file, tells clojure-lsp about it and returns once
-the re-analysis is done. A file that is already formatted yields no edits
-and nothing is written. Re-read the file before editing it again after an
-applied format; your copy of it is stale. The command formats whole files,
-one per call.
+`--apply` it writes the file, tells clojure-lsp about it and waits for the
+re-analysis, up to two send deadlines (a minute by default). A file that
+is already formatted yields no edits and nothing is written. Re-read the
+file before editing it again after an applied format; your copy of it is
+stale. The command formats whole files, one per call.
+If the output says "analysis not confirmed", clojure-lsp did not confirm
+its analysis of the written files within the wait. The next edit command
+first waits for that analysis, re-sending the changes if no analysis is
+running, and is refused if it is still not confirmed within two deadlines.
 
-If the command reports that no proxy is running, the LSP server for this
-project has not started yet: run any LSP tool query first.
+When the command reports that no proxy is running: if Claude Code has
+not started the LSP server for this project yet, run any LSP query
+first, then retry.
