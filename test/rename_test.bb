@@ -9,6 +9,8 @@
             [clojure.string :as str]
             [clojure.test :refer [deftest is run-tests testing]]
             [clojure-lsp-proxy.client :as client]
+            [clojure-lsp-proxy.cli :as cli]
+            [clojure-lsp-proxy.command :as command]
             [clojure-lsp-proxy.control :as control]
             [clojure-lsp-proxy.edit :as edit]
             [clojure-lsp-proxy.framing :as framing]
@@ -32,6 +34,31 @@
     (is (= "λ yell" (edit/apply-text-edits "λ shout" [{"range" (range* 0 2 0 7) "newText" "yell"}]))))
   (testing "an edit spanning lines"
     (is (= "a\nX\nd" (edit/apply-text-edits "a\nb\nc\nd" [{"range" (range* 1 0 2 1) "newText" "X"}])))))
+
+(deftest consumed-edit-needs-a-command-in-flight-test
+  (testing "with no own command in flight nothing is recorded and no marker is created"
+    (is (= {:other 1} (command/with-consumed-edit {:other 1} {"changes" {}}))))
+  (testing "with a command in flight the edit is appended to its consumed edits"
+    (is (= {:own-command {:command "clean-ns" :consumed-edits [{"a" 1} {"b" 2}]}}
+           (command/with-consumed-edit {:own-command {:command "clean-ns" :consumed-edits [{"a" 1}]}} {"b" 2})))))
+
+(deftest apply-edit-skips-unchanged-files-test
+  (let [dir (fs/create-temp-dir {:prefix "clojure-lsp-proxy-edit"})
+        same (str (fs/path dir "same.clj"))
+        other (str (fs/path dir "other.clj"))
+        touched (atom [])]
+    (spit same "(ns same)\n")
+    (spit other "(ns other)\n")
+    (fs/set-last-modified-time same (java.nio.file.attribute.FileTime/fromMillis 1000))
+    (edit/apply-edit! {"documentChanges" [{"textDocument" {"uri" (str "file://" same)}
+                                           "edits" [{"range" (range* 0 0 0 9) "newText" "(ns same)"}]}
+                                          {"textDocument" {"uri" (str "file://" other)}
+                                           "edits" [{"range" (range* 0 4 0 9) "newText" "changed"}]}]}
+                      touched)
+    (is (= [other] @touched) "a change that leaves the text as it is does not count as touched")
+    (is (= 1000 (.toMillis (fs/last-modified-time same))) "and its file is not written")
+    (is (= "(ns changed)\n" (slurp other)) "the other change in the same edit is applied")
+    (fs/delete-tree dir)))
 
 ;;; end to end
 
@@ -457,6 +484,124 @@
         (is (false? (get reply "ok")))
         (is (str/includes? (get reply "error") "no such file"))))
     (is (= 0 (stop! proxy)))))
+
+(defn received!
+  "What the fake server has received so far, in order."
+  [proxy]
+  (send! proxy {"jsonrpc" "2.0" "id" "received" "method" "fake/received"})
+  (loop []
+    (let [m (recv! proxy)]
+      (cond
+        (= ::timeout m) m
+        (= "received" (get m "id")) (get m "result")
+        :else (recur)))))
+
+(deftest refactor-test
+  (let [proxy (start-proxy)
+        path (str (fs/path (:project proxy) "src/live/core.clj"))
+        unclean "(ns live.core\n  (:require [clojure.set :as set]\n            [live.util :as util]))\n\n(defn greet [n]\n  (util/shout n))\n"
+        cleaned-ns "(ns live.core\n  (:require [live.util :as util]))"
+        cleaned (str cleaned-ns "\n\n(defn greet [n]\n  (util/shout n))\n")
+        ;; the shape the clojure-lsp nightly answers for clean-ns: documentChanges, version 0,
+        ;; one edit replacing the whole ns form
+        clean-ns-edit (fn [end-line end-character]
+                        {"documentChanges" [{"textDocument" {"uri" (uri proxy "src/live/core.clj") "version" 0}
+                                             "edits" [{"range" (range* 0 0 end-line end-character) "newText" cleaned-ns}]}]})
+        refactor! (fn [file apply?] (client/request! (:socket proxy) {:op "refactor" :command "clean-ns" :file file :apply apply?} 70000))
+        apply-edit-messages (fn [dir] (filter #(and (= dir (get % "dir")) (= "workspace/applyEdit" (get % "method"))) (log-entries proxy)))]
+    (spit path unclean)
+    (initialize! proxy)
+    (configure! proxy {"progress" {"create_after_ms" 1100 "end_after_ms" 100 "title" "Analyzing external file changes"}
+                       "replies" {"workspace/executeCommand" {"edit" (clean-ns-edit 2 34)}}})
+    (testing "dry run returns the command's edit and changes nothing"
+      (let [reply (refactor! path false)]
+        (is (= {"ok" true "applied" false "edit" (clean-ns-edit 2 34) "summary" {"files" 1 "edits" 1 "renamed_files" 0}} reply))
+        (is (= unclean (text proxy "src/live/core.clj")))
+        (is (= {"command" "clean-ns" "arguments" [(uri proxy "src/live/core.clj") 0 0]}
+               (get-in (first (filter #(= "workspace/executeCommand" (get % "method")) (log-entries proxy))) ["body" "params"])))))
+    (testing "the server's applyEdit is answered applied:false by the proxy and never reaches the client"
+      (let [fake-request-id (get (first (apply-edit-messages "s->p")) "id")]
+        (is (some? fake-request-id))
+        (is (= [{"response" fake-request-id "result" {"applied" false "failureReason" "clojure-lsp-proxy applies the command result"}}]
+               (filter #(= fake-request-id (get % "response")) (received! proxy))))
+        (is (empty? (apply-edit-messages "s->c")))
+        (is (= ["clean-ns"] (keep #(when (= "apply-edit-consumed" (get % "event")) (get % "command")) (log-entries proxy))))
+        (is (not-any? #(= "anomaly" (get % "event")) (log-entries proxy)) "the consumed edit equals the result")))
+    (testing "apply writes the cleaned file, reports it and waits for the analysis"
+      (let [t0 (System/currentTimeMillis)
+            reply (refactor! path true)]
+        (is (= {"ok" true "applied" true "timed_out" false "touched" [path]} (dissoc reply "edit" "summary")))
+        (is (= cleaned (text proxy "src/live/core.clj")))
+        (is (<= 1100 (- (System/currentTimeMillis) t0)) "answered after the re-analysis")
+        (is (some #(= "clean-ns-applied" (get % "event")) (log-entries proxy)))
+        (is (= [#{(uri proxy "src/live/core.clj")}] (sent-uris proxy)) "the cleaned file was reported")))
+    (testing "an already clean file: clojure-lsp proposes its ns form unchanged, nothing is written or reported"
+      (configure! proxy {"replies" {"workspace/executeCommand" {"edit" (clean-ns-edit 1 34)}}})
+      (fs/set-last-modified-time path (java.nio.file.attribute.FileTime/fromMillis 1000))
+      (is (= {"ok" true "applied" true "touched" [] "timed_out" false} (dissoc (refactor! path true) "edit" "summary")))
+      (is (= cleaned (text proxy "src/live/core.clj")))
+      (is (= 1000 (.toMillis (fs/last-modified-time path))) "not written")
+      (is (= 1 (count (sent-uris proxy))) "not reported"))
+    (testing "an applyEdit that differs from the command's result is consumed and logged as an anomaly"
+      (configure! proxy {"replies" {"workspace/executeCommand" {"edit" (clean-ns-edit 1 34) "apply_edit" (clean-ns-edit 0 0)}}})
+      (let [reply (refactor! path false)]
+        (is (true? (get reply "ok")))
+        (is (= (clean-ns-edit 1 34) (get reply "edit")) "the edit returned is the command's result, not the consumed applyEdit"))
+      (is (= ["consumed-edit-differs-from-result"] (keep #(when (= "anomaly" (get % "event")) (get % "kind")) (log-entries proxy)))))
+    (testing "a server error is refused with its message"
+      (configure! proxy {"replies" {"workspace/executeCommand" {"error" {"code" -32600 "message" "Could not find a form at this location."}}}})
+      (let [reply (refactor! path true)]
+        (is (false? (get reply "ok")))
+        (is (str/includes? (get reply "error") "Could not find a form at this location."))))
+    (testing "no edit at all (clojure-lsp answers null for a file without an ns form) is refused"
+      (configure! proxy {"replies" {"workspace/executeCommand" nil}})
+      (let [reply (refactor! path true)]
+        (is (false? (get reply "ok")))
+        (is (str/includes? (get reply "error") "clean-ns proposed no edit"))))
+    (testing "a missing file is refused before clojure-lsp is asked"
+      (let [asked (count (filter #(= "workspace/executeCommand" (get % "method")) (log-entries proxy)))
+            reply (refactor! (str (fs/path (:project proxy) "src/live/nope.clj")) false)]
+        (is (false? (get reply "ok")))
+        (is (str/includes? (get reply "error") "no such file"))
+        (is (= asked (count (filter #(= "workspace/executeCommand" (get % "method")) (log-entries proxy)))))))
+    (is (= 0 (stop! proxy)))))
+
+(deftest edit-commands-refused-before-initialized-test
+  (let [proxy (start-proxy)
+        path (str (fs/path (:project proxy) "src/live/core.clj"))
+        status (fn [] (client/request! (:socket proxy) {:op "status"} 5000))
+        server-requests #{"textDocument/rename" "textDocument/formatting" "workspace/executeCommand"
+                          "workspace/symbol" "clojure/cursorInfo/raw" "workspace/willRenameFiles"}]
+    (send! proxy {"jsonrpc" "2.0" "id" 1 "method" "initialize" "params" {"capabilities" {}}})
+    (recv! proxy)
+    (testing "between initialize and initialized, status says the server is not ready"
+      (is (false? (get (status) "server_ready"))))
+    (testing "rename, format and clean-ns are refused with nothing sent to the server"
+      (doseq [request [{:op "rename" :file path :line 4 :character 8 :new_name "yell" :apply true}
+                       {:op "rename" :symbol "live.util/shout" :new_name "yell" :apply false}
+                       {:op "format" :file path :apply true}
+                       {:op "refactor" :command "clean-ns" :file path :apply true}]]
+        (let [reply (client/request! (:socket proxy) request 10000)]
+          (is (false? (get reply "ok")) (pr-str request))
+          (is (str/includes? (str (get reply "error")) "has not finished initializing") (pr-str request))))
+      (is (empty? (filter #(server-requests (get % "method")) (received! proxy))))
+      (is (empty? (filter #(server-requests (get % "method")) (log-entries proxy)))))
+    (testing "after initialized the same commands reach the server"
+      (send! proxy {"jsonrpc" "2.0" "method" "initialized" "params" {}})
+      (configure! proxy {"replies" {"textDocument/formatting" []}})
+      (is (true? (get (status) "server_ready")))
+      (is (true? (get (client/request! (:socket proxy) {:op "format" :file path :apply false} 10000) "ok")))
+      (is (= ["textDocument/formatting"] (keep #(server-requests (get % "method")) (received! proxy)))))
+    (is (= 0 (stop! proxy)))))
+
+(deftest cli-reports-unconfirmed-analysis-test
+  (let [printed (fn [reply] (with-out-str (#'cli/print-edit reply)))
+        applied {"edit" {"documentChanges" []} "summary" {"files" 0 "edits" 0 "renamed_files" 0}
+                 "applied" true "touched" []}]
+    (is (str/includes? (printed (assoc applied "timed_out" true)) "analysis not confirmed")
+        "an applied edit whose re-analysis ran out says so")
+    (is (not (str/includes? (printed (assoc applied "timed_out" false)) "analysis not confirmed"))
+        "a confirmed analysis prints no warning")))
 
 (let [{:keys [fail error]} (run-tests 'rename-test)]
   (shutdown-agents)

@@ -21,6 +21,16 @@
 ;; `workspace/willRenameFiles`); a reply `{"error": {...}}` is sent as an
 ;; error response, and a reply `{"by_uri": {uri: result}}` answers per
 ;; `params.textDocument.uri`.
+;;
+;; Refactor commands, emulating clojure-lsp: a canned reply for
+;; `workspace/executeCommand` of the form `{"edit": workspace-edit}` makes
+;; the fake send that edit to the client as a `workspace/applyEdit`
+;; request, wait for the answer and then reply with the edit as the
+;; command's result (`"apply_edit"` in the reply sends a different edit in
+;; the applyEdit than in the result). An error reply or a null reply is sent without an
+;; applyEdit. `fake/apply-edit` sends its params as a `workspace/applyEdit`
+;; on the fake's own initiative. Responses from the client are recorded in
+;; `fake/received` with their result.
 (require '[babashka.classpath :refer [add-classpath]]
          '[babashka.fs :as fs])
 (add-classpath (str (fs/path (fs/parent (fs/parent (fs/canonicalize *file*))) "src")))
@@ -74,7 +84,7 @@
           method (get msg "method")
           id (get msg "id")]
       (if (nil? method)
-        (do (swap! received conj {"response" id})
+        (do (swap! received conj {"response" id "result" (get msg "result")})
             (some-> (get @pending-requests id) (deliver msg)))
         (do
           (swap! received conj (cond-> {"method" method "id" id}
@@ -96,11 +106,17 @@
                                  (swap! replies merge (get-in msg ["params" "replies"])))
             "fake/progress" (run-progress! (get msg "params"))
             "fake/client-progress" (progress! (get-in msg ["params" "token"]) (get-in msg ["params" "value"]))
+            "fake/apply-edit" (future (request! "workspace/applyEdit" (get msg "params")))
             "workspace/didChangeWatchedFiles" (doseq [config (let [c @progress-config] (if (map? c) [c] c))]
                                                  (run-progress! config))
             (when id
               (if-let [[_ canned] (find @replies method)]
                 (cond
+                  (and (= "workspace/executeCommand" method) (map? canned) (contains? canned "edit"))
+                  (future
+                    (deref (request! "workspace/applyEdit" {"edit" (get canned "apply_edit" (get canned "edit"))}) 10000 nil)
+                    (reply! id (get canned "edit")))
+
                   (and (map? canned) (get canned "error"))
                   (send! {"jsonrpc" "2.0" "id" id "error" (get canned "error")})
 

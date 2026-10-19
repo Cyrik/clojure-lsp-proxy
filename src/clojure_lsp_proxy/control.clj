@@ -6,6 +6,7 @@
   (:require [babashka.fs :as fs]
             [cheshire.core :as json]
             [clojure-lsp-proxy.changes :as changes]
+            [clojure-lsp-proxy.command :as command]
             [clojure-lsp-proxy.detect :as detect]
             [clojure-lsp-proxy.edit :as edit]
             [clojure-lsp-proxy.format :as fmt]
@@ -144,6 +145,9 @@
     "format" (do (locking (:snapshot-lock proxy)
                    (reconcile! proxy "format"))
                  (fmt/format! proxy request))
+    "refactor" (do (locking (:snapshot-lock proxy)
+                     (reconcile! proxy "refactor"))
+                   (command/refactor! proxy request))
     {:ok false :error (str "unknown op: " (pr-str op))}))
 
 (declare serve-request!)
@@ -170,7 +174,7 @@
                   :else (try
                           (handle-request proxy request)
                           (catch Exception e
-                            {:ok false :error (str e)})))]
+                            {:ok false :error (or (ex-message e) (str e))})))]
       (transport/log-event! proxy "control" :op (when (map? request) (get request "op")) :reply reply)
       (.write writer (json/generate-string reply))
       (.write writer "\n")

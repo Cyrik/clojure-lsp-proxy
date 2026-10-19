@@ -10,7 +10,9 @@
   On top of forwarding, the proxy owns the server's work-done progress,
   injects `workspace/didChangeWatchedFiles` for changes reported over its
   control socket and holds the client's messages until the server has
-  analyzed them (see `clojure-lsp-proxy.gate`).
+  analyzed them (see `clojure-lsp-proxy.gate`). While one of its own
+  refactor commands runs, it answers the server's `workspace/applyEdit`
+  itself (see `clojure-lsp-proxy.command`).
 
   Exit rules: after the client's `exit` was forwarded, or after the client
   closed stdin, the proxy shuts the server down if needed and exits 0. When
@@ -23,6 +25,7 @@
             [babashka.process :as p]
             [clojure.java.io :as io]
             [clojure.string :as str]
+            [clojure-lsp-proxy.command :as command]
             [clojure-lsp-proxy.control :as control]
             [clojure-lsp-proxy.detect :as detect]
             [clojure-lsp-proxy.framing :as framing]
@@ -107,6 +110,9 @@
               (transport/deliver-own-response! proxy msg))
 
           (gate/handle-server-message! proxy msg)
+          nil
+
+          (command/consume-apply-edit! proxy msg)
           nil
 
           :else
@@ -204,6 +210,8 @@
                :client-lock (Object.)
                :gate-lock (Object.)
                :snapshot-lock (Object.)
+               ;; one own executeCommand at a time, see clojure-lsp-proxy.command
+               :command-lock (Object.)
                :own-request-counter (atom 0)
                :send-deadline-ms (send-deadline-ms)
                :state (atom (merge {:exit-forwarded? false

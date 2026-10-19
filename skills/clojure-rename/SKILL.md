@@ -46,10 +46,16 @@ Quote a new name that contains `?` or `*`, such as `'valid?'`, or the shell
 expands it as a glob.
 
 Without `--apply` the command prints the edits and changes nothing. With
-`--apply` it writes the files, tells clojure-lsp about them and returns
-once the re-analysis is done, so LSP queries right after it are current.
+`--apply` it writes the files, tells clojure-lsp about them and waits for
+the re-analysis, up to two send deadlines (a minute by default); once it
+has finished, LSP queries see the renamed code.
 Re-read a file before editing it again after an applied rename; your copy
 of it is stale.
+If the output says "analysis not confirmed", clojure-lsp did not confirm
+its analysis of the written files within the wait. The next edit command
+first waits for that analysis, re-sending the changes if no analysis is
+running, and is refused if it is still not confirmed within two deadlines.
 
-If the command reports that no proxy is running, the LSP server for this
-project has not started yet: run any LSP tool query first.
+When the command reports that no proxy is running: if Claude Code has
+not started the LSP server for this project yet, run any LSP query
+first, then retry.
