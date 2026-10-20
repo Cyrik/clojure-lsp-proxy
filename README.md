@@ -78,6 +78,12 @@ clone) is live in the next session; `claude plugin update` only acts on a
 version change. For a one-off session, `claude --plugin-dir <clone>`
 works too and registers before any installed plugin.
 
+The proxy needs clojure-lsp 2026.10.15 or newer (`clojure-lsp --version`),
+the first release that reports watched-file analysis progress
+([clojure-lsp#2474](https://github.com/clojure-lsp/clojure-lsp/pull/2474)).
+With an older one, navigation works but every reported change holds
+requests for the 30 s deadline, and the log says so (see "The server").
+
 The marketplace can also come straight from GitHub,
 `claude plugin marketplace add Cyrik/clojure-lsp-proxy`, with the same
 install command. That installs a copy in Claude Code's plugin cache
@@ -96,6 +102,20 @@ the whole project analysis before it answers `initialize`.
 
 ## The server
 
+The gate needs a clojure-lsp that reports watched-file analysis as
+work-done progress
+([clojure-lsp#2474](https://github.com/clojure-lsp/clojure-lsp/pull/2474)):
+release 2026.10.15 or newer, or any nightly built from master since
+2026-10-05. A release `clojure-lsp` on PATH is the default and needs no
+configuration; check it with `clojure-lsp --version`. Package managers
+such as Homebrew may ship a new release some time after it is published.
+
+With an older clojure-lsp, navigation works but no analysis progress ever
+arrives: every reported change holds the client's requests for the full
+deadline (default 30 s), the log says so (`send-dropped` with a hint), and
+rename and format are refused after the first change report because no
+analysis confirms it.
+
 The proxy runs `CLOJURE_LSP_PROXY_SERVER` when that variable is set (a
 path, or a command on PATH), else `clojure-lsp` on PATH. A path that is
 not an executable file is ignored: the proxy logs `server-fallback` and
@@ -107,26 +127,19 @@ the `env` block of `~/.claude/settings.json`:
 "env": { "CLOJURE_LSP_PROXY_SERVER": "/Users/you/.local/share/clojure-lsp-nightly/clojure-lsp" }
 ```
 
-The gate needs a clojure-lsp that reports watched-file analysis as
-work-done progress: any build of master from 2026-10-05 on
-([clojure-lsp#2474](https://github.com/clojure-lsp/clojure-lsp/pull/2474),
-merged), so the next release and every nightly since. clojure-lsp
-publishes a nightly (a native image) for every commit on master; its
-install script fetches the newest one, without sudo when given a
-directory:
+The variable is optional. One use is running a build newer than the
+latest release: clojure-lsp publishes a nightly (a native image) for
+every commit on master, and its install script fetches the newest one,
+without sudo when given a directory:
 
 ```
 curl -O https://raw.githubusercontent.com/clojure-lsp/clojure-lsp/master/install
 chmod +x install && ./install --version nightly --dir ~/.local/share/clojure-lsp-nightly
 ```
 
-Point the variable at the `clojure-lsp` it installs (a directory off PATH
-leaves the release in place for other tools); rerunning the script
-upgrades. With an older clojure-lsp instead, navigation works but no
-analysis progress ever arrives: every reported change holds the client's
-requests for the full deadline (default 30 s), the log says so
-(`send-dropped` with a hint), and rename and format are refused after the
-first change report because no analysis confirms it.
+Point the variable at the `clojure-lsp` it installs, as in the example
+above (a directory off PATH leaves the release in place for other
+tools); rerunning the script upgrades.
 
 The traffic log is a JSONL file at
 `~/.cache/clojure-lsp-proxy/<sha1 of the project root>/<proxy pid>.log`, or
