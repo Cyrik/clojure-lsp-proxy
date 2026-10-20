@@ -54,26 +54,42 @@ and hooks run, `src/` the Babashka code, `test/` the suites (`bb test`).
 
 ## Running it
 
+Clone the repository anywhere; `<clone>` below stands for that
+directory. It needs Babashka (`bb` on PATH, or in `~/.local/bin`,
+`/opt/homebrew/bin` or `/usr/local/bin`) and a clojure-lsp (see "The
+server").
+
+```
+git clone https://github.com/Cyrik/clojure-lsp-proxy <clone>
+```
+
 The repository is its own marketplace (`.claude-plugin/marketplace.json`,
 one plugin with source `./`). Installed once with
 
 ```
-claude plugin marketplace add /Users/lukas/Workspace/clojure/clojure-lsp-proxy
+claude plugin marketplace add <clone>
 claude plugin install clojure-lsp-proxy@clojure-lsp-proxy
 ```
 
 every new session loads it, whatever started Claude Code. A relative-path
 plugin of a directory marketplace runs in place: the proxy's `start` event
-logs `CLAUDE_PLUGIN_ROOT` as this repository, so an edit here is live in
-the next session; `claude plugin update` only acts on a version change.
-For a one-off session, `claude --plugin-dir <this repository>` works too
-and registers before any installed plugin.
+logs `CLAUDE_PLUGIN_ROOT` as `<clone>`, so `git pull` (or an edit in the
+clone) is live in the next session; `claude plugin update` only acts on a
+version change. For a one-off session, `claude --plugin-dir <clone>`
+works too and registers before any installed plugin.
+
+The marketplace can also come straight from GitHub,
+`claude plugin marketplace add Cyrik/clojure-lsp-proxy`, with the same
+install command. That installs a copy in Claude Code's plugin cache
+instead of running in place, so it upgrades only when the plugin's
+`version` changes (`claude plugin marketplace update clojure-lsp-proxy`,
+then `claude plugin update clojure-lsp-proxy@clojure-lsp-proxy`).
 
 Only one plugin may serve `.clj`: Claude Code gives each extension to the
 first LSP server registered and logs the losers under `--debug`
-("extension .clj already handled by ..."). Among installed plugins
-`clojure-lsp-cc` registers before this one, so it is disabled
-(`claude plugin disable clojure-lsp-cc@clojure-lsp-cc`).
+("extension .clj already handled by ..."). Any other plugin that
+registers an LSP server for `.clj` (for example `clojure-lsp-cc`) has to
+be disabled with `claude plugin disable <plugin>@<marketplace>`.
 
 `.lsp.json` sets `startupTimeout` to five minutes because clojure-lsp runs
 the whole project analysis before it answers `initialize`.
